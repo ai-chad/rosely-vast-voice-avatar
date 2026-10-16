@@ -12,8 +12,31 @@ ARCHIVE_DIR="${WORKSPACE}/rosely-bundle-download"
 CACHE_ARCHIVE="${ARCHIVE_DIR}/${BUNDLE_NAME}.tar.zst"
 CACHE_SHA="${CACHE_ARCHIVE}.sha256"
 S3_PREFIX="${S3_PREFIX:-s3://rosely-infrastructure/serverless/voice-avatar}"
-AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-export AWS_DEFAULT_REGION
+MODEL_S3_URI="${MODEL_S3_URI:-${S3_PREFIX}/${BUNDLE_NAME}.tar.zst}"
+ROSELY_AVATAR_S3_REGION="${ROSELY_AVATAR_S3_REGION:-us-east-1}"
+
+# Avoid Vast template collisions with standard AWS credential variables.  These
+# names live only in the private Vast template; never write values to disk/logs.
+s3_cp(){
+  [[ -n "${ROSELY_AVATAR_S3_ACCESS_KEY_ID:-}" ]] || die 'Missing ROSELY_AVATAR_S3_ACCESS_KEY_ID'
+  [[ -n "${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY:-}" ]] || die 'Missing ROSELY_AVATAR_S3_SECRET_ACCESS_KEY'
+  local -a credentials=(
+    -u AWS_SESSION_TOKEN
+    -u AWS_PROFILE
+    -u AWS_DEFAULT_PROFILE
+    "AWS_ACCESS_KEY_ID=${ROSELY_AVATAR_S3_ACCESS_KEY_ID}"
+    "AWS_SECRET_ACCESS_KEY=${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY}"
+    "AWS_DEFAULT_REGION=${ROSELY_AVATAR_S3_REGION}"
+    "AWS_REGION=${ROSELY_AVATAR_S3_REGION}"
+    AWS_SHARED_CREDENTIALS_FILE=/dev/null
+    AWS_CONFIG_FILE=/dev/null
+    AWS_EC2_METADATA_DISABLED=true
+  )
+  if [[ -n "${ROSELY_AVATAR_S3_SESSION_TOKEN:-}" ]]; then
+    credentials+=("AWS_SESSION_TOKEN=${ROSELY_AVATAR_S3_SESSION_TOKEN}")
+  fi
+  env "${credentials[@]}" aws s3 cp "$@" --region "$ROSELY_AVATAR_S3_REGION"
+}
 
 [[ "$(id -u)" == 0 ]] || die 'Run sudo -E bash provision_vast.sh (root required for apt packages).'
 command -v nvidia-smi >/dev/null || die 'NVIDIA GPU is not visible.'
@@ -55,19 +78,25 @@ else
       curl -fL --retry 5 --retry-delay 5 "$MODEL_ARCHIVE_URL" -o "$CACHE_ARCHIVE"
       curl -fL --retry 5 --retry-delay 5 "$MODEL_SHA_URL" -o "$CACHE_SHA"
     else
-      log "Downloading $S3_PREFIX/${BUNDLE_NAME}.tar.zst (requires read-only S3 IAM credentials)"
-      aws s3 cp "$S3_PREFIX/${BUNDLE_NAME}.tar.zst" "$CACHE_ARCHIVE" --region "$AWS_DEFAULT_REGION"
-      aws s3 cp "$S3_PREFIX/${BUNDLE_NAME}.tar.zst.sha256" "$CACHE_SHA" --region "$AWS_DEFAULT_REGION"
+      log "Downloading ${MODEL_S3_URI} (requires read-only S3 IAM credentials)"
+      s3_cp "$MODEL_S3_URI" "$CACHE_ARCHIVE"
+      s3_cp "${MODEL_S3_URI}.sha256" "$CACHE_SHA"
     fi
   elif [[ ! -s "$CACHE_SHA" ]]; then
     if [[ -n "${MODEL_SHA_URL:-}" ]]; then
       curl -fL --retry 5 "$MODEL_SHA_URL" -o "$CACHE_SHA"
     else
-      aws s3 cp "$S3_PREFIX/${BUNDLE_NAME}.tar.zst.sha256" "$CACHE_SHA" --region "$AWS_DEFAULT_REGION"
+      s3_cp "${MODEL_S3_URI}.sha256" "$CACHE_SHA"
     fi
   fi
   log 'Verifying downloaded archive SHA256 before extracting'
   (cd "$ARCHIVE_DIR" && sha256sum -c "$(basename "$CACHE_SHA")") || die 'Archive digest mismatch.'
+  if [[ -n "${MODEL_ARCHIVE_SHA256:-}" ]]; then
+    [[ "$(sha256sum "$CACHE_ARCHIVE" | awk '{print $1}')" == "$MODEL_ARCHIVE_SHA256" ]] || die 'Provided MODEL_ARCHIVE_SHA256 does not match archive.'
+  fi
+  if [[ -n "${MODEL_ARCHIVE_SIZE:-}" ]]; then
+    [[ "$(stat -c %s "$CACHE_ARCHIVE")" == "$MODEL_ARCHIVE_SIZE" ]] || die 'Provided MODEL_ARCHIVE_SIZE does not match downloaded bytes.'
+  fi
   log 'Extracting prebuilt checkpoints and MuseTalk source (no Hugging Face downloads)'
   tar --zstd -xf "$CACHE_ARCHIVE" -C "$WORKSPACE" --no-same-owner
   models_complete || die 'Extracted archive missing expected checkpoints or manifest.'

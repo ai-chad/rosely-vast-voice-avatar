@@ -4,6 +4,8 @@ import asyncio
 import base64
 import binascii
 import hmac
+import hashlib
+import re
 import os
 from contextlib import asynccontextmanager
 
@@ -21,6 +23,8 @@ MAX_STT_AUDIO_BYTES = int(os.getenv('MAX_STT_AUDIO_BYTES', str(50*1024*1024)))
 MAX_AVATAR_FILE_BYTES = int(os.getenv('MAX_AVATAR_SOURCE_BYTES', str(25*1024*1024)))
 MAX_AVATAR_AUDIO_BYTES = int(os.getenv('MAX_AVATAR_AUDIO_BYTES', str(10*1024*1024)))
 client: httpx.AsyncClient | None = None
+# A single GPU may not tolerate simultaneous ASR, TTS and MuseTalk render jobs.
+gpu_request_lock = asyncio.Lock()
 
 
 def authorize(key: str | None):
@@ -101,8 +105,9 @@ async def stt(request: STTRequest, x_api_key: str | None = Header(default=None))
         raise HTTPException(413, 'empty or oversized audio')
     form_data = {'language': request.language} if request.language else {}
     try:
-        result = await client.post(ASR_URL + '/v1/audio/transcriptions', headers=internal_headers(),
-                                   files={'file': (request.filename, audio, request.content_type)}, data=form_data)
+        async with gpu_request_lock:
+            result = await client.post(ASR_URL + '/v1/audio/transcriptions', headers=internal_headers(),
+                                       files={'file': (request.filename, audio, request.content_type)}, data=form_data)
     except httpx.HTTPError as exc:
         raise HTTPException(502, f'ASR error: {exc}')
     if result.status_code >= 400:
@@ -115,8 +120,9 @@ async def tts(request: TTSRequest, x_api_key: str | None = Header(default=None))
     authorize(x_api_key)
     assert client is not None
     try:
-        result = await client.post(TTS_URL + '/v1/audio/speech', headers=internal_headers(),
-                                   json=request.model_dump(exclude_none=True))
+        async with gpu_request_lock:
+            result = await client.post(TTS_URL + '/v1/audio/speech', headers=internal_headers(),
+                                       json=request.model_dump(exclude_none=True))
     except httpx.HTTPError as exc:
         raise HTTPException(502, f'TTS error: {exc}')
     if result.status_code >= 400:
@@ -163,3 +169,74 @@ async def avatar_render(avatar_id: str = Form(...), audio: UploadFile = File(...
         raise upstream_error('avatar', result)
     return Response(result.content, media_type='video/mp4',
                     headers={'Cache-Control': 'no-store', 'Content-Disposition': 'attachment; filename="avatar.mp4"'})
+
+
+class GenerateAvatarRequest(BaseModel):
+    """One-request Serverless adapter. Multi-request prepared-avatar IDs are not durable across workers."""
+    image_base64: str = Field(min_length=1)
+    audio_base64: str | None = None
+    input: str | None = Field(default=None, max_length=2500)
+    voice: str | None = None
+    image_filename: str = "character.png"
+
+
+@app.post('/v1/avatar/generate')
+async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None = Header(default=None)):
+    authorize(x_api_key)
+    assert client is not None
+    if bool(request.audio_base64) == bool(request.input):
+        raise HTTPException(400, 'provide exactly one of audio_base64 or input')
+    # Reject oversized b64 before materializing decoded files.
+    if len(request.image_base64) > ((MAX_AVATAR_FILE_BYTES + 2) // 3) * 4 + 16:
+        raise HTTPException(413, 'image too large')
+    try:
+        image = base64.b64decode(request.image_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, 'invalid image_base64')
+    if not image or len(image) > MAX_AVATAR_FILE_BYTES:
+        raise HTTPException(413, 'empty or oversized image')
+    suffix = '.' + request.image_filename.rsplit('.', 1)[-1].lower() if '.' in request.image_filename else ''
+    if suffix not in {'.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.webm'}:
+        raise HTTPException(400, 'unsupported image_filename extension')
+    # Content-addressed IDs prevent accidental collisions; cache is worker-local only.
+    avatar_id = 's' + hashlib.sha256(image).hexdigest()[:24]
+    async with gpu_request_lock:
+        if request.audio_base64 is not None:
+            if len(request.audio_base64) > ((MAX_AVATAR_AUDIO_BYTES + 2) // 3) * 4 + 16:
+                raise HTTPException(413, 'audio too large')
+            try:
+                audio = base64.b64decode(request.audio_base64, validate=True)
+            except (binascii.Error, ValueError):
+                raise HTTPException(400, 'invalid audio_base64')
+            if not audio or len(audio) > MAX_AVATAR_AUDIO_BYTES:
+                raise HTTPException(413, 'empty or oversized audio')
+        else:
+            try:
+                speech = await client.post(TTS_URL + '/v1/audio/speech',
+                    headers=internal_headers(), json={'input': request.input, 'voice': request.voice})
+            except httpx.HTTPError as exc:
+                raise HTTPException(502, f'TTS request failed: {exc}') from exc
+            if speech.status_code >= 400:
+                raise upstream_error('tts', speech)
+            audio = speech.content
+        # Every serverless worker has its own local avatar cache.
+        try:
+            prepared = await client.post(AVATAR_URL + '/v1/avatar/prepare',
+                headers=internal_headers(), data={'avatar_id': avatar_id},
+                files={'file': ('character'+suffix, image, 'application/octet-stream')})
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f'avatar preparation request failed: {exc}') from exc
+        if prepared.status_code not in (200, 409):
+            raise upstream_error('avatar', prepared)
+        try:
+            rendered = await client.post(AVATAR_URL + '/v1/avatar/render',
+                headers=internal_headers(), data={'avatar_id': avatar_id},
+                files={'audio': ('speech.wav', audio, 'audio/wav')})
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f'avatar rendering request failed: {exc}') from exc
+        if rendered.status_code >= 400:
+            raise upstream_error('avatar', rendered)
+        # For short POC videos only. Production should upload MP4 to S3 and return a signed URL.
+        return {'video_base64': base64.b64encode(rendered.content).decode('ascii'),
+                'content_type': 'video/mp4', 'size_bytes': len(rendered.content),
+                'avatar_id': avatar_id}
