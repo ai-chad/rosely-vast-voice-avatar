@@ -8,6 +8,12 @@ export VOICE_API_KEY GATEWAY_API_KEY BUNDLE_ROOT ASR_MODEL_PATH TTS_MODEL_PATH V
 export AVATAR_MEDIA_ROOT MUSE_PYTHON ASR_PORT TTS_PORT AVATAR_PORT GATEWAY_PORT MUSE_BATCH_SIZE
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export SERVERLESS_ADAPTER_PORT="${SERVERLESS_ADAPTER_PORT:-8004}"
+
+# Vast official pyworker bootstrap supplies these defaults. Our custom worker
+# launches the SDK directly, so it must supply them itself.
+export WORKER_PORT="${WORKER_PORT:-3000}"
+export REPORT_ADDR="${REPORT_ADDR:-https://run.vast.ai}"
+
 mkdir -p "$WORKSPACE/rosely-logs" "$WORKSPACE/rosely-run"
 # Existing launcher starts each service on internal ports and waits until healthy.
 bash "$APP_DIR/start_services.sh"
@@ -34,7 +40,20 @@ for i in $(seq 1 120); do
 done
 curl -fsS "http://127.0.0.1:${SERVERLESS_ADAPTER_PORT}/health" >/dev/null
 if [[ "${SERVERLESS:-false}" == "true" ]]; then
-  echo '[Rosely] Starting custom Vast PyWorker (managed Serverless mode)'
+  # The metrics SDK reads VAST_TCP_PORT_${WORKER_PORT}, PUBLIC_IPADDR,
+  # CONTAINER_ID, REPORT_ADDR. Never invent the actual mapped public port.
+  for required in PUBLIC_IPADDR CONTAINER_ID; do
+    if [[ -z "${!required:-}" ]]; then
+      echo "[Rosely ERROR] Required Vast worker variable ${required} is not available" >&2
+      exit 1
+    fi
+  done
+  mapped_port_var="VAST_TCP_PORT_${WORKER_PORT}"
+  if [[ -z "${!mapped_port_var:-}" ]]; then
+    echo "[Rosely ERROR] ${mapped_port_var} missing. Check that port ${WORKER_PORT} is mapped in the Vast template." >&2
+    exit 1
+  fi
+  echo "[Rosely] Starting Vast PyWorker on internal port ${WORKER_PORT} (public mapping exists)"
   "$WORKSPACE/rosely-venvs/asr/bin/python" "$APP_DIR/worker.py"
 else
   echo '[Rosely] Standalone debug mode: APIs running; PyWorker intentionally disabled'
