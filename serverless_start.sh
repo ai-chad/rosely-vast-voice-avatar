@@ -33,4 +33,10 @@ for i in $(seq 1 120); do
   sleep 2
 done
 curl -fsS "http://127.0.0.1:${SERVERLESS_ADAPTER_PORT}/health" >/dev/null
-"$WORKSPACE/rosely-venvs/asr/bin/python" "$APP_DIR/worker.py"
+if [[ "${SERVERLESS:-false}" == "true" ]]; then
+  echo '[Rosely] Starting custom Vast PyWorker (managed Serverless mode)'
+  "$WORKSPACE/rosely-venvs/asr/bin/python" "$APP_DIR/worker.py"
+else
+  echo '[Rosely] Standalone debug mode: APIs running; PyWorker intentionally disabled'
+  wait "$adapter_pid"
+fi

@@ -179,7 +179,11 @@ install_tts(){
   "$py" -m pip install --no-cache-dir torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
   "$py" -m pip install --no-cache-dir 'chatterbox-tts==0.1.7' 'fastapi>=0.115,<1' 'uvicorn[standard]>=0.30,<1' \
     'python-multipart>=0.0.18' 'httpx>=0.28,<1'
-  "$py" -c 'import perth; assert perth.PerthImplicitWatermarker is not None'
+  # Perth's optional audio watermarking import can resolve to None when recent
+  # setuptools removes pkg_resources. Keep the existing guard, but first pin
+  # a compatible setuptools release in TTS's *isolated* environment only.
+  "$py" -m pip install --no-cache-dir 'setuptools==80.10.2'
+  "$py" -c 'import perth; assert perth.PerthImplicitWatermarker is not None, "PerthImplicitWatermarker missing; inspect TTS environment"'
 }
 install_muse(){
   local py="$ENVS/muse/bin/python"

@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Requires Vast CLI authenticated: vastai set api-key <key>
-# This creates an instance for testing. Attach the new template to a Vast Serverless endpoint/worker group separately.
+# RTX 3090 Serverless template with OPT-IN SSH debug access.
+# Always select Docker ENTRYPOINT (NOT SSH/Jupyter runtime) and leave entrypoint args blank.
+# Usage: export OFFER_ID=...; export ROSELY_AVATAR_S3_ACCESS_KEY_ID=...;
+#        export ROSELY_AVATAR_S3_SECRET_ACCESS_KEY=...; bash VAST_TEMPLATE_COMMAND.sh
+# CAUTION: Vast CLI receives S3 secrets as instance environment variables.
 set -Eeuo pipefail
-: "${OFFER_ID:?Export OFFER_ID (your RTX 3090 offer ID)}"
-GITHUB_REPO="${GITHUB_REPO:-https://github.com/ai-chad/rosely-vast-voice-avatar}"
-: "${ROSELY_AVATAR_S3_ACCESS_KEY_ID:?Provide dedicated read-only key as an environment variable}"
-: "${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY:?Provide dedicated read-only secret as an environment variable}"
-REPO_RAW="https://raw.githubusercontent.com/${GITHUB_REPO#https://github.com/}/main"
-# Optional temporary STS session token, only when the access key requires one.
-SESSION_TOKEN_OPT=""
+: "${OFFER_ID:?Set OFFER_ID to your GPU offer ID}"
+: "${ROSELY_AVATAR_S3_ACCESS_KEY_ID:?S3 key missing}"
+: "${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY:?S3 secret missing}"
+GITHUB_REPO=https://github.com/ai-chad/rosely-vast-voice-avatar
+RAW_REPO=https://raw.githubusercontent.com/ai-chad/rosely-vast-voice-avatar/main
+STS_OPTION=''
 if [[ -n "${ROSELY_AVATAR_S3_SESSION_TOKEN:-}" ]]; then
-  SESSION_TOKEN_OPT=" -e ROSELY_AVATAR_S3_SESSION_TOKEN=${ROSELY_AVATAR_S3_SESSION_TOKEN}"
+  STS_OPTION=" -e ROSELY_AVATAR_S3_SESSION_TOKEN=${ROSELY_AVATAR_S3_SESSION_TOKEN}"
 fi
 vastai create instance "$OFFER_ID" \
   --image vastai/base-image:cuda-12.4.1-cudnn-devel-ubuntu22.04-py310 \
-  --env "-p 3000:3000 -e SERVERLESS=true -e PYWORKER_REPO=${GITHUB_REPO} -e PYWORKER_REF=main -e PROVISIONING_SCRIPT=${REPO_RAW}/provision_serverless.sh -e MODEL_S3_URI=s3://rosely-infrastructure/serverless/voice-avatar/rosely-voice-musetalk-v1.tar.zst -e ROSELY_AVATAR_S3_ACCESS_KEY_ID=${ROSELY_AVATAR_S3_ACCESS_KEY_ID} -e ROSELY_AVATAR_S3_SECRET_ACCESS_KEY=${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY} -e ROSELY_AVATAR_S3_REGION=${ROSELY_AVATAR_S3_REGION:-us-east-1}${SESSION_TOKEN_OPT} -e FETCH_BUILTIN_VOICES=1 -e MUSE_BATCH_SIZE=4 -e GATEWAY_PORT=8000 -e SERVERLESS_ADAPTER_PORT=8004" \
-  --disk 150
+  --env "-p 3000:3000 -p 22:22 -e SERVERLESS=true -e ROSELY_ENABLE_SSH=true -e SUPERVISOR_SKIP_PYWORKER=true -e PYWORKER_REPO=${GITHUB_REPO} -e PYWORKER_REF=main -e PROVISIONING_SCRIPT=${RAW_REPO}/provision_serverless.sh -e MODEL_S3_URI=s3://rosely-infrastructure/serverless/voice-avatar/rosely-voice-musetalk-v1.tar.zst -e ROSELY_AVATAR_S3_ACCESS_KEY_ID=${ROSELY_AVATAR_S3_ACCESS_KEY_ID} -e ROSELY_AVATAR_S3_SECRET_ACCESS_KEY=${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY} -e ROSELY_AVATAR_S3_REGION=${ROSELY_AVATAR_S3_REGION:-us-east-1}${STS_OPTION} -e MUSE_BATCH_SIZE=4 -e FETCH_BUILTIN_VOICES=1 -e GATEWAY_PORT=8000 -e SERVERLESS_ADAPTER_PORT=8004" \
+  --disk 100
