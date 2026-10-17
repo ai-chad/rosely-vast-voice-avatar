@@ -58,7 +58,7 @@ startsecs=2
 startretries=10
 stopsignal=TERM
 stopwaitsecs=10
-stdout_logfile=/workspace/rosely-logs/rosely-serverless-supervisor.log
+stdout_logfile=/workspace/rosely-logs/rosely-debug-sshd.log
 stdout_logfile_maxbytes=20MB
 stdout_logfile_backups=3
 redirect_stderr=true
@@ -77,7 +77,9 @@ CONF
   die 'sshd did not reach RUNNING state. Check Vast instance logs before provisioning.'
 }
 
-mkdir -p "$WORKSPACE"
+# Must exist BEFORE sshd Supervisor registration; missing logfile directory can
+# prevent Supervisor from starting sshd on brand-new workers.
+mkdir -p "$WORKSPACE" "$WORKSPACE/rosely-logs"
 configure_debug_ssh
 
 # Clone current code only after SSH is reachable so pip/S3 failures are
@@ -91,7 +93,7 @@ cd "$APP_DIR"
 bash provision_vast.sh
 "$WORKSPACE/rosely-venvs/asr/bin/python" -m pip install --no-cache-dir -r requirements.txt
 chmod +x serverless_start.sh
-cat > /etc/supervisor/conf.d/rosely-serverless.conf <<EOF
+cat > /etc/supervisor/conf.d/rosely-serverless.conf <<EOF2
 [program:rosely-serverless]
 environment=PROC_NAME="%(program_name)s"
 command=/bin/bash ${APP_DIR}/serverless_start.sh
@@ -104,10 +106,11 @@ stopasgroup=true
 killasgroup=true
 stopsignal=TERM
 stopwaitsecs=30
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
+stdout_logfile=${WORKSPACE}/rosely-logs/rosely-serverless-supervisor.log
+stdout_logfile_maxbytes=20MB
+stdout_logfile_backups=3
 redirect_stderr=true
-EOF
+EOF2
 supervisorctl reread
 supervisorctl update
 log 'Model provisioning and service configuration complete.'
