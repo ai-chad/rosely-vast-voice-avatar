@@ -187,15 +187,33 @@ install_muse(){
   "$py" -m pip install --no-cache-dir torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
   "$py" -m pip install --no-cache-dir -r "$BUNDLE_ROOT/source/MuseTalk/requirements.txt"
   "$py" -m pip install --no-cache-dir openmim 'fastapi>=0.115,<1' 'uvicorn[standard]>=0.30,<1' 'python-multipart>=0.0.18'
+  # mmpose 1.1.0 requires chumpy 0.70, whose setup.py imports pip. PEP 517
+  # isolated builds don't provide pip and fail with ModuleNotFoundError.
+  # Build chumpy explicitly in the MuseTalk venv before installing mmpose.
+  log 'Installing chumpy==0.70 without PEP 517 build isolation'
+  "$py" -m pip install --no-cache-dir 'setuptools<82' wheel
+  "$py" -m pip install --no-cache-dir --no-build-isolation 'chumpy==0.70'
   "$ENVS/muse/bin/mim" install mmengine
   "$ENVS/muse/bin/mim" install 'mmcv==2.0.1'
   "$ENVS/muse/bin/mim" install 'mmdet==3.1.0'
   "$ENVS/muse/bin/mim" install 'mmpose==1.1.0'
 }
 
-if [[ ! -e "$ENVS/asr/.rosely_installed" ]]; then install_asr && touch "$ENVS/asr/.rosely_installed"; fi
-if [[ ! -e "$ENVS/tts/.rosely_installed" ]]; then install_tts && touch "$ENVS/tts/.rosely_installed"; fi
-if [[ ! -e "$ENVS/muse/.rosely_installed" ]]; then install_muse && touch "$ENVS/muse/.rosely_installed"; fi
+# IMPORTANT: do not call installers in `install_muse && touch ...` expressions.
+# That disables errexit inside the function and can mark a broken install as ready.
+if [[ ! -e "$ENVS/asr/.rosely_installed" ]]; then
+  install_asr
+  touch "$ENVS/asr/.rosely_installed"
+fi
+if [[ ! -e "$ENVS/tts/.rosely_installed" ]]; then
+  install_tts
+  touch "$ENVS/tts/.rosely_installed"
+fi
+if [[ ! -e "$ENVS/muse/.rosely_installed" ]]; then
+  install_muse
+  "$ENVS/muse/bin/python" -c 'import mmpose; import mmdet; import mmcv; from mmcv.ops import nms; print("MuseTalk pose dependencies loaded")'
+  touch "$ENVS/muse/.rosely_installed"
+fi
 
 log 'Checking service source code syntax'
 for entry in asr_server.py tts_server.py voice_gateway.py avatar_server.py; do
