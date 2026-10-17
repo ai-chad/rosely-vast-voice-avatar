@@ -58,8 +58,9 @@ startsecs=2
 startretries=10
 stopsignal=TERM
 stopwaitsecs=10
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
+stdout_logfile=/workspace/rosely-logs/rosely-serverless-supervisor.log
+stdout_logfile_maxbytes=20MB
+stdout_logfile_backups=3
 redirect_stderr=true
 CONF
   supervisorctl reread
