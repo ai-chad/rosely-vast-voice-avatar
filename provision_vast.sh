@@ -35,7 +35,9 @@ s3_cp(){
   if [[ -n "${ROSELY_AVATAR_S3_SESSION_TOKEN:-}" ]]; then
     credentials+=("AWS_SESSION_TOKEN=${ROSELY_AVATAR_S3_SESSION_TOKEN}")
   fi
-  env "${credentials[@]}" aws s3 cp "$@" --region "$ROSELY_AVATAR_S3_REGION"
+  # Use AWS CLI v2 bundled executable, not Ubuntu's awscli v1 (which can break
+  # when Vast's global Python provides newer urllib3).
+  env "${credentials[@]}" /usr/local/bin/aws s3 cp "$@" --region "$ROSELY_AVATAR_S3_REGION"
 }
 
 [[ "$(id -u)" == 0 ]] || die 'Run sudo -E bash provision_vast.sh (root required for apt packages).'
@@ -46,8 +48,42 @@ command -v apt-get >/dev/null || die 'Ubuntu/Debian instance required.'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-  awscli ca-certificates curl ffmpeg git openssl python3 python3-venv python3-pip \
+  unzip ca-certificates curl ffmpeg git openssl python3 python3-venv python3-pip \
   libsndfile1 libsox-fmt-all sox zstd libgl1 libglib2.0-0 libgomp1
+
+# Install the self-contained AWS CLI v2. Ubuntu 22.04 apt awscli v1 imports
+# Python packages from /usr/local and fails with urllib3 2.x (DEFAULT_CIPHERS).
+# CLI v2 bundles its own runtime, and all S3 calls above use its absolute path.
+ensure_aws_cli_v2(){
+  if [[ -x /usr/local/bin/aws ]] &&
+     /usr/local/bin/aws --version 2>&1 | grep -qE '^aws-cli/2[.]'; then
+    log 'AWS CLI v2 already installed, reusing it.'
+    return 0
+  fi
+  log 'Installing standalone AWS CLI v2 (bypasses system Python dependencies)'
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  (
+    set -Eeuo pipefail
+    trap 'rm -rf "$temp_dir"' EXIT
+    curl --fail --location --silent --show-error --retry 5 --retry-delay 3 \
+      'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' \
+      -o "$temp_dir/awscliv2.zip"
+    unzip -q "$temp_dir/awscliv2.zip" -d "$temp_dir"
+    if [[ -d /usr/local/aws-cli/v2/current ]]; then
+      "$temp_dir/aws/install" --install-dir /usr/local/aws-cli \
+        --bin-dir /usr/local/bin --update
+    else
+      "$temp_dir/aws/install" --install-dir /usr/local/aws-cli \
+        --bin-dir /usr/local/bin
+    fi
+  )
+  [[ -x /usr/local/bin/aws ]] || die 'AWS CLI v2 executable not created.'
+  /usr/local/bin/aws --version 2>&1 | grep -qE '^aws-cli/2[.]' || \
+    die 'AWS CLI v2 verification failed.'
+  log "AWS CLI ready: $(/usr/local/bin/aws --version 2>&1)"
+}
+ensure_aws_cli_v2
 
 mkdir -p "$WORKSPACE" "$ARCHIVE_DIR"
 ESSENTIAL=(
@@ -79,14 +115,20 @@ else
       curl -fL --retry 5 --retry-delay 5 "$MODEL_SHA_URL" -o "$CACHE_SHA"
     else
       log "Downloading ${MODEL_S3_URI} (requires read-only S3 IAM credentials)"
-      s3_cp "$MODEL_S3_URI" "$CACHE_ARCHIVE"
-      s3_cp "${MODEL_S3_URI}.sha256" "$CACHE_SHA"
+      # Download to *.partial first. A broken network download must not be
+      # mistaken for a complete 9.9 GiB archive on the next provisioning run.
+      rm -f "${CACHE_ARCHIVE}.partial" "${CACHE_SHA}.partial"
+      s3_cp "$MODEL_S3_URI" "${CACHE_ARCHIVE}.partial"
+      mv "${CACHE_ARCHIVE}.partial" "$CACHE_ARCHIVE"
+      s3_cp "${MODEL_S3_URI}.sha256" "${CACHE_SHA}.partial"
+      mv "${CACHE_SHA}.partial" "$CACHE_SHA"
     fi
   elif [[ ! -s "$CACHE_SHA" ]]; then
     if [[ -n "${MODEL_SHA_URL:-}" ]]; then
       curl -fL --retry 5 "$MODEL_SHA_URL" -o "$CACHE_SHA"
     else
-      s3_cp "${MODEL_S3_URI}.sha256" "$CACHE_SHA"
+      s3_cp "${MODEL_S3_URI}.sha256" "${CACHE_SHA}.partial"
+      mv "${CACHE_SHA}.partial" "$CACHE_SHA"
     fi
   fi
   log 'Verifying downloaded archive SHA256 before extracting'
