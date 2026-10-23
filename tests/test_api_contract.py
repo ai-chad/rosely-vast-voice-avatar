@@ -1,4 +1,4 @@
-"""Lightweight tests of request validation; GPU and S3 integration tested on Vast."""
+"""Lightweight tests of request validation; GPU and model-download integration tested on Vast."""
 import importlib.util
 import sys
 from pathlib import Path

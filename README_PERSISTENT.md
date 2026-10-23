@@ -2,7 +2,7 @@
 
 **New, separate deployment. Does not modify the working RTX 5060 / `rosely-vast-voice` endpoint.**
 
-This repository deploys three existing/open-source model stacks from the **single model archive already uploaded to S3**, plus an authenticated API gateway:
+This repository deploys three existing/open-source model stacks, downloaded at provisioning time directly from **Hugging Face** (pinned revisions, SHA256-verified), plus an authenticated API gateway:
 
 | Service | Model | Loopback port | External gateway route |
 |---|---|---:|---|
@@ -17,7 +17,9 @@ This repository deploys three existing/open-source model stacks from the **singl
 
 ```text
 rosely-vast-voice-avatar/
-├── provision_vast.sh         # private S3 download, digest verification, isolated Python environments
+├── provision_vast.sh         # Hugging Face model download, isolated Python environments
+├── fetch_models.py           # pinned HF repos/revisions; verifies every file against models.sha256
+├── models.sha256             # expected SHA256 of the 30 runtime checkpoint files
 ├── start_services.sh         # 8001 ASR, 8002 TTS, 8003 avatar, 8000 gateway
 ├── asr_server.py             # existing Qwen3-ASR request contract
 ├── tts_server.py             # existing Chatterbox Turbo endpoints + voice references
@@ -26,18 +28,12 @@ rosely-vast-voice-avatar/
 ├── test_poc.py               # tests one character end-to-end from your laptop
 ├── tests/                   # local no-GPU API checks
 ├── requirements-dev.txt
-├── .env.example
-└── docs/S3_READ_ONLY_POLICY.json
+└── .env.example
 ```
 
-**Do not commit the 9.9 GiB S3 checkpoint archive or credentials to GitHub.** It is retrieved at provisioning time from:
+**Do not commit checkpoints or tokens to GitHub.** `fetch_models.py` downloads them from these Hugging Face repos (revisions pinned in the script): `Qwen/Qwen3-ASR-0.6B`, `ResembleAI/chatterbox-turbo`, `TMElyralab/MuseTalk` (v1.5 UNet), `stabilityai/sd-vae-ft-mse`, `openai/whisper-tiny`, `yzd-v/DWPose`, `ByteDance/LatentSync`, and `ManyOtherFunctions/face-parse-bisent` (byte-identical mirror of the face-parsing weights upstream fetches from Google Drive). MuseTalk source is fetched from GitHub at commit `0a89dec`.
 
-```text
-s3://rosely-infrastructure/serverless/voice-avatar/rosely-voice-musetalk-v1.tar.zst
-s3://rosely-infrastructure/serverless/voice-avatar/rosely-voice-musetalk-v1.tar.zst.sha256
-```
-
-The S3 bundle contains:
+The resulting bundle layout:
 
 ```text
 rosely-voice-musetalk-v1/
@@ -64,30 +60,17 @@ Choose **Vast On-demand/Reserved Instance (persistent)** rather than Serverless,
 - **NVIDIA RTX 3090 24 GB**, one GPU. Prefer a host with driver support for CUDA 12.4 (NVIDIA driver **550+**), Ubuntu 22.04 CUDA/PyTorch-compatible image.
 - **At least 80 GB disk**, ideally 100+ GB, 32 GB system RAM and 8 CPU cores for comfortable installation, preprocessing and clip testing.
 - Expose **container TCP port `8000`** in Vast. The externally mapped *host* port may differ; check Vast's port mapping page. Internal ports 8001–8003 bind only to 127.0.0.1.
-- Allow outbound HTTPS to S3, PyPI/PyTorch/MMLab, Astral Python runtime downloads, and optionally the old public GitHub repo for the 28 style voice samples.
+- Allow outbound HTTPS to Hugging Face, GitHub, PyPI/PyTorch/MMLab, Astral Python runtime downloads, and optionally the old public GitHub repo for the 28 style voice samples.
 
 For a persistent instance, **do not use `PYWORKER_REPO` / Vast PyWorker** as the deployment mechanism. Those are for Vast Serverless queued JSON jobs; this prototype uses a regular instance's port mapping. Streaming calls need a permanent connection in the next phase.
 
-### Give the new instance S3 read-only access
+### Hugging Face token
 
-Option A — *recommended for repeatable boots:* Create a dedicated access key restricted to `GetObject` on the two archive/checksum keys. See `docs/S3_READ_ONLY_POLICY.json`. Put `ROSELY_AVATAR_S3_ACCESS_KEY_ID` and `ROSELY_AVATAR_S3_SECRET_ACCESS_KEY` in Vast **private environment settings**, not in Git. With a fresh machine terminal, check:
-
-```bash
-# Test the namespaced Vast credentials without relying on cached AWS variables.
-env -u AWS_SESSION_TOKEN -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
-  AWS_ACCESS_KEY_ID="$ROSELY_AVATAR_S3_ACCESS_KEY_ID" \
-  AWS_SECRET_ACCESS_KEY="$ROSELY_AVATAR_S3_SECRET_ACCESS_KEY" \
-  AWS_DEFAULT_REGION="${ROSELY_AVATAR_S3_REGION:-us-east-1}" \
-  aws sts get-caller-identity
-```
-
-If using temporary credentials, add `AWS_SESSION_TOKEN="$ROSELY_AVATAR_S3_SESSION_TOKEN"` to the invocation. The provisioner handles this automatically.
-
-Option B — pre-signed temporary HTTPS URLs. On your EC2 with AWS access, generate presigned GET URLs for each S3 object using `aws s3 presign ... --expires-in 21600`, then set `MODEL_ARCHIVE_URL` and `MODEL_SHA_URL` in the Vast instance environment. These URLs expire; the archive only needs to be downloaded during initial provisioning. Treat URLs as credentials.
+Put a **read-only** `HUGGINGFACE_TOKEN` in Vast **private environment settings**, not in Git. The repos are public, so the token only avoids anonymous rate limits; `HF_TOKEN` is accepted as a fallback.
 
 ## 2. Create a new GitHub repository
 
-Unzip this package and push it to your own newly created repository; models remain in S3:
+Unzip this package and push it to your own newly created repository; models are downloaded from Hugging Face at provisioning time:
 
 ```bash
 unzip rosely-vast-voice-avatar-serverless-repo-updated.zip
@@ -110,24 +93,24 @@ git clone https://github.com/ai-chad/rosely-vast-voice-avatar.git rosely-vast-vo
 cd /workspace/rosely-vast-voice-avatar
 
 nvidia-smi
-# Your restricted S3 credentials must already be available as environment variables.
+# HUGGINGFACE_TOKEN should already be available as an environment variable.
 sudo -E bash provision_vast.sh
 sudo -E bash start_services.sh
 ```
 
 Provisioner behavior:
 
-1. Downloads the archived **9.9 GiB** model bundle and its checksum from the exact S3 path.
-2. Verifies `sha256sum` before extracting to `/workspace/rosely-voice-musetalk-v1` and verifies per-model file checksums from the manifest.
-3. Reuses the original Qwen and Chatterbox checkpoints; no Hugging Face model download takes place.
+1. Fetches MuseTalk source from GitHub (pinned commit) into `/workspace/rosely-voice-musetalk-v1/source/MuseTalk`.
+2. Downloads the 30 checkpoint files (~12 GB) from Hugging Face at pinned revisions and verifies each against `models.sha256`; reruns skip files that already match.
+3. These are the same bytes as the original S3 bundle (checksums identical), so behavior is unchanged.
 4. Creates isolated Python 3.10 environments in `/workspace/rosely-venvs/{asr,tts,muse}` to keep model dependencies compatible.
 5. Installs the current voice dependencies, then **upstream MuseTalk 1.5** dependencies: Torch 2.0.1/CUDA11.8 and MMLab. This step needs network access and may require troubleshooting CUDA/MMLab wheels on your chosen Vast OS image.
 6. By default, downloads the same **28 `en_female_*` / `en_male_*` style voice samples** from the old public voice GitHub repository, preserving Chatterbox voice IDs. Set `FETCH_BUILTIN_VOICES=0` if you will supply these WAVs yourself.
 7. Generates `/workspace/rosely-voice-avatar.env` containing new private internal/API gateway keys. Existing keys are preserved if you rerun the provisioner.
 
-**Do not copy voice sample WAVs from arbitrary sources; ensure you have rights for each reference voice.** User-uploaded custom voice references on the old 5060 are **not** included in the S3 model archive. Copy them separately only when authorized, if you need the same personal/custom IDs.
+**Do not copy voice sample WAVs from arbitrary sources; ensure you have rights for each reference voice.** User-uploaded custom voice references on the old 5060 are **not** part of the model download. Copy them separately only when authorized, if you need the same personal/custom IDs.
 
-If provisioning fails during MuseTalk dependency installation, fix the failure before starting services. A checkpoint archive does not include preinstalled CUDA libraries or a working inference environment.
+If provisioning fails during MuseTalk dependency installation, fix the failure before starting services. Checkpoints do not include preinstalled CUDA libraries or a working inference environment.
 
 ## 4. Check services and API key
 
@@ -192,9 +175,9 @@ POC limits: 25 MiB source media, 10 MiB source audio, 12-second audio clip, two-
 
 ## 6. Troubleshooting
 
-**S3 AccessDenied** — Outside AWS, Vast has no EC2 instance IAM role; use scoped S3 credentials or presigned URLs. Confirm `aws sts get-caller-identity`. Do not grant `s3:*` or put credentials in Git.
+**Hugging Face 401/429** — Check `HUGGINGFACE_TOKEN` is set in the Vast template and is a valid read token. Rerun `provision_vast.sh`; files already verified are skipped.
 
-**S3 checksum failed** — Do not extract. Recheck S3 object key and the separately uploaded SHA file; delete the partial local archive, redownload and verify again.
+**SHA256 mismatch** — `fetch_models.py` deletes the bad file and stops. Rerun to download it again; a persistent mismatch means the pinned revision or `models.sha256` was edited inconsistently.
 
 **MuseTalk dependency/MMLab installation failed** — Choose Ubuntu 22.04 with modern NVIDIA driver; this project intentionally uses upstream Python3.10, Torch2.0.1+cu118 and MMLab versions, separate from Torch2.6+cu124 voice environments. Read pip/mim error output. Some GPUs/images may need compatible prebuilt `mmcv` wheels. GPU-dependent install/inference was not exercised when this ZIP was authored.
 

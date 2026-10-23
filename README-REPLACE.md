@@ -2,8 +2,8 @@
 
 ## Files to replace (repository root)
 
-- `provision_serverless.sh` **required** – starts key-only `sshd` via Supervisor BEFORE cloning/downloading S3 models, regardless of Vast's `SERVERLESS` status.
-- `provision_vast.sh` **required** – same AWS CLI v2, SHA256, chumpy fixes as current GitHub code, with a setuptools 80.10.2 pin before the Perth TTS import check.
+- `provision_serverless.sh` **required** – starts key-only `sshd` via Supervisor BEFORE cloning/downloading models, regardless of Vast's `SERVERLESS` status.
+- `provision_vast.sh` **required** – Hugging Face model download (`fetch_models.py`, SHA256-verified) and chumpy fixes, with a setuptools 80.10.2 pin before the Perth TTS import check.
 - `serverless_start.sh` **recommended** – only launches `worker.py` when `SERVERLESS=true`; otherwise runs API adapter persistently for standalone debugging.
 - `VAST_TEMPLATE_COMMAND.sh` **optional** – corrected example template command, 100 GB disk. Don't put keys in git.
 
@@ -14,7 +14,7 @@ Select **Docker ENTRYPOINT**. Leave args and on-start command EMPTY.
 Image: `vastai/base-image:cuda-12.4.1-cudnn-devel-ubuntu22.04-py310`
 Disk: `100` GB (watch space)
 Expose exactly `-p 3000:3000 -p 22:22` (8080 and 1111 are not required for SSH)
-Keep your S3/GitHub values and custom `ROSELY_AVATAR_S3_*` keys.
+Keep your GitHub values; set `HUGGINGFACE_TOKEN` (the old `MODEL_S3_URI` and `ROSELY_AVATAR_S3_*` variables are no longer read and can be removed).
 
 Add/modify these env vars for a **managed Serverless workgroup debug worker**:
 
@@ -33,7 +33,7 @@ For a **standalone instance not part of Vast Serverless**, set `SERVERLESS=false
 
 Add your Windows *public* key to **Vast Account > SSH Keys**, BEFORE launching the worker. The Vast base-image entrypoint normally injects it into `/root/.ssh/authorized_keys`. The patch validates it before any 9.9 GiB model download. It optionally accepts the Vast-provided `SSH_PUBLIC_KEY` env var if authorized_keys is empty. It NEVER enables passwords.
 
-Do **not** put your private SSH key in any template. Do not add S3 secrets to GitHub.
+Do **not** put your private SSH key in any template. Do not add tokens to GitHub.
 
 ### After you push the files
 

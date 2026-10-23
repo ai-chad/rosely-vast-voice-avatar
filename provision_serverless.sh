@@ -10,7 +10,7 @@ die(){ printf '[Rosely boot ERROR] %s\n' "$*" >&2; exit 1; }
 
 # Vast launches supervisord before the custom provisioning script. Its
 # Docker ENTRYPOINT mode DOES NOT automatically install an SSH daemon.
-# This is intentionally before git clone, S3 download, and pip installs so
+# This is intentionally before git clone, model download, and pip installs so
 # that an interactive shell is available throughout long provisioning.
 configure_debug_ssh(){
   [[ "${ROSELY_ENABLE_SSH:-false}" == "true" ]] || { log 'SSH bootstrap disabled (ROSELY_ENABLE_SSH != true)'; return 0; }
@@ -82,7 +82,7 @@ CONF
 mkdir -p "$WORKSPACE" "$WORKSPACE/rosely-logs"
 configure_debug_ssh
 
-# Clone current code only after SSH is reachable so pip/S3 failures are
+# Clone current code only after SSH is reachable so pip/download failures are
 # debuggable without having to destroy/recreate the GPU instance.
 if [[ ! -d "$APP_DIR/.git" ]]; then
   git clone --depth 1 --branch "$REF" "$REPO" "$APP_DIR"

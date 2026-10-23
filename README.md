@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-A Vast custom PyWorker for queued clip inference on one RTX 3090 24 GB. It installs the exact combined checkpoint archive uploaded to `s3://rosely-infrastructure/serverless/voice-avatar/rosely-voice-musetalk-v1.tar.zst`. It is **not** a persistent WebRTC video-call service and is **not** tested on a rented Vast RTX 3090 yet. The earlier `README_PERSISTENT.md` documents standalone/interactive execution.
+A Vast custom PyWorker for queued clip inference on one RTX 3090 24 GB. At boot it downloads every checkpoint directly from Hugging Face at pinned revisions and verifies each file against `models.sha256` (`fetch_models.py`); MuseTalk source comes from GitHub at a pinned commit. It is **not** a persistent WebRTC video-call service and is **not** tested on a rented Vast RTX 3090 yet. The earlier `README_PERSISTENT.md` documents standalone/interactive execution.
 
 ### Model servers and endpoints
 
@@ -23,16 +23,13 @@ Upload the extracted contents at the root of the repo (not the parent folder), s
 
 - Image: `vastai/base-image:cuda-12.4.1-cudnn-devel-ubuntu22.04-py310` (official Vast CUDA Ubuntu 22.04 variant; validate chosen host driver and image availability)
 - Minimum GPU: RTX 3090 24 GB. Allow 32 GB RAM and 8 vCPU if possible.
-- Disk: `150` GB recommended for downloading/extracting the 9.9 GiB model bundle plus three isolated Python environments and build caches.
+- Disk: `100` GB is enough (about 12 GB of checkpoints plus three isolated Python environments and build caches; 32 GB used in practice).
 - Container port mapping: `-p 3000:3000`. **Do not** map the gateway 8000 or internal model ports publicly.
 - `SERVERLESS=true`
 - `PYWORKER_REPO=https://github.com/ai-chad/rosely-vast-voice-avatar`
 - `PYWORKER_REF=main`
 - `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/ai-chad/rosely-vast-voice-avatar/main/provision_serverless.sh`
-- `MODEL_S3_URI=s3://rosely-infrastructure/serverless/voice-avatar/rosely-voice-musetalk-v1.tar.zst`
-- `ROSELY_AVATAR_S3_ACCESS_KEY_ID`, `ROSELY_AVATAR_S3_SECRET_ACCESS_KEY`: restricted `s3:GetObject` credentials for **two objects** (archive and `.sha256`). Put them only in a **private Vast template**, never git or a publicly viewable environment. They are deliberately custom names to avoid Vast-cached standard AWS variables; provisioning maps them to standard AWS CLI credentials only in the child process.
-- `ROSELY_AVATAR_S3_REGION=us-east-1`
-- Optional: `MODEL_ARCHIVE_SHA256` and `MODEL_ARCHIVE_SIZE`, actual values only; remote `.sha256` is downloaded and validated even without optional values.
+- `HUGGINGFACE_TOKEN`: a **read-only** Hugging Face token. All model repos are public; the token avoids anonymous rate limits. Put it only in a **private Vast template**, never git. (`HF_TOKEN` is accepted as a fallback.) No S3 or AWS credentials are needed.
 - `MUSE_BATCH_SIZE=4`, `FETCH_BUILTIN_VOICES=1`
 
 Use a purpose-specific CUDA/base image rather than ComfyUI; this does not run ComfyUI, and **do not set `BACKEND=comfyui-json`**. Also do not use the `-e AWS_ZIT_IMAGE_*` vars, which these scripts do not read.
@@ -40,12 +37,12 @@ Use a purpose-specific CUDA/base image rather than ComfyUI; this does not run Co
 ### What happens on boot
 
 1. Vast base image executes `PROVISIONING_SCRIPT` as root after Supervisor starts.
-2. It clones `PYWORKER_REPO`, invokes `provision_vast.sh`, downloads the bundle and its checksum, validates both archive and inner weights, and installs 3 isolated Python 3.10 model environments.
+2. It clones `PYWORKER_REPO` and invokes `provision_vast.sh`, which fetches MuseTalk source from GitHub, downloads the 30 checkpoint files from Hugging Face (pinned revisions, SHA256-verified, resumable), and installs 3 isolated Python 3.10 model environments. A worker that already has a complete bundle skips the download.
 3. It installs `vastai-sdk` and registers a Supervisor program `rosely-serverless`.
 4. Supervisor runs `serverless_start.sh`, starts 4 FastAPI processes, waits until they are healthy and starts `worker.py`.
 5. PyWorker benchmarks the TTS route (short input) and announces readiness via Vast.
 
-The first provisioning can be lengthy because it downloads 9.9 GiB and installs CUDA, PyTorch and MMLab dependencies. A prebuilt derivative Docker image is preferable once inference has been validated.
+The first provisioning can be lengthy because it installs CUDA, PyTorch and MMLab dependencies; the ~12 GB Hugging Face download itself took about 3 minutes on a Vast RTX 3090 host. A prebuilt derivative Docker image is preferable once inference has been validated.
 
 ### Vast endpoint
 

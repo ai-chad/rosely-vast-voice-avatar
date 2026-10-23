@@ -8,37 +8,12 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${WORKSPACE:-/workspace}"
 BUNDLE_NAME="rosely-voice-musetalk-v1"
 BUNDLE_ROOT="${BUNDLE_ROOT:-${WORKSPACE}/${BUNDLE_NAME}}"
-ARCHIVE_DIR="${WORKSPACE}/rosely-bundle-download"
-CACHE_ARCHIVE="${ARCHIVE_DIR}/${BUNDLE_NAME}.tar.zst"
-CACHE_SHA="${CACHE_ARCHIVE}.sha256"
-S3_PREFIX="${S3_PREFIX:-s3://rosely-infrastructure/serverless/voice-avatar}"
-MODEL_S3_URI="${MODEL_S3_URI:-${S3_PREFIX}/${BUNDLE_NAME}.tar.zst}"
-ROSELY_AVATAR_S3_REGION="${ROSELY_AVATAR_S3_REGION:-us-east-1}"
+MUSETALK_COMMIT="0a89dec45a0192b824e3cf4daf96c239440c5ed8"
 
-# Avoid Vast template collisions with standard AWS credential variables.  These
-# names live only in the private Vast template; never write values to disk/logs.
-s3_cp(){
-  [[ -n "${ROSELY_AVATAR_S3_ACCESS_KEY_ID:-}" ]] || die 'Missing ROSELY_AVATAR_S3_ACCESS_KEY_ID'
-  [[ -n "${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY:-}" ]] || die 'Missing ROSELY_AVATAR_S3_SECRET_ACCESS_KEY'
-  local -a credentials=(
-    -u AWS_SESSION_TOKEN
-    -u AWS_PROFILE
-    -u AWS_DEFAULT_PROFILE
-    "AWS_ACCESS_KEY_ID=${ROSELY_AVATAR_S3_ACCESS_KEY_ID}"
-    "AWS_SECRET_ACCESS_KEY=${ROSELY_AVATAR_S3_SECRET_ACCESS_KEY}"
-    "AWS_DEFAULT_REGION=${ROSELY_AVATAR_S3_REGION}"
-    "AWS_REGION=${ROSELY_AVATAR_S3_REGION}"
-    AWS_SHARED_CREDENTIALS_FILE=/dev/null
-    AWS_CONFIG_FILE=/dev/null
-    AWS_EC2_METADATA_DISABLED=true
-  )
-  if [[ -n "${ROSELY_AVATAR_S3_SESSION_TOKEN:-}" ]]; then
-    credentials+=("AWS_SESSION_TOKEN=${ROSELY_AVATAR_S3_SESSION_TOKEN}")
-  fi
-  # Use AWS CLI v2 bundled executable, not Ubuntu's awscli v1 (which can break
-  # when Vast's global Python provides newer urllib3).
-  env "${credentials[@]}" /usr/local/bin/aws s3 cp "$@" --region "$ROSELY_AVATAR_S3_REGION"
-}
+# Checkpoints come straight from Hugging Face (pinned revisions, SHA256-checked
+# by fetch_models.py). HUGGINGFACE_TOKEN is set in the private Vast template;
+# the repos are public, the token only avoids anonymous rate limits.
+export HUGGINGFACE_TOKEN="${HUGGINGFACE_TOKEN:-${HF_TOKEN:-}}"
 
 [[ "$(id -u)" == 0 ]] || die 'Run sudo -E bash provision_vast.sh (root required for apt packages).'
 command -v nvidia-smi >/dev/null || die 'NVIDIA GPU is not visible.'
@@ -48,44 +23,10 @@ command -v apt-get >/dev/null || die 'Ubuntu/Debian instance required.'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-  unzip ca-certificates curl ffmpeg git openssl python3 python3-venv python3-pip \
-  libsndfile1 libsox-fmt-all sox zstd libgl1 libglib2.0-0 libgomp1
+  ca-certificates curl ffmpeg git openssl python3 python3-venv python3-pip \
+  libsndfile1 libsox-fmt-all sox libgl1 libglib2.0-0 libgomp1
 
-# Install the self-contained AWS CLI v2. Ubuntu 22.04 apt awscli v1 imports
-# Python packages from /usr/local and fails with urllib3 2.x (DEFAULT_CIPHERS).
-# CLI v2 bundles its own runtime, and all S3 calls above use its absolute path.
-ensure_aws_cli_v2(){
-  if [[ -x /usr/local/bin/aws ]] &&
-     /usr/local/bin/aws --version 2>&1 | grep -qE '^aws-cli/2[.]'; then
-    log 'AWS CLI v2 already installed, reusing it.'
-    return 0
-  fi
-  log 'Installing standalone AWS CLI v2 (bypasses system Python dependencies)'
-  local temp_dir
-  temp_dir="$(mktemp -d)"
-  (
-    set -Eeuo pipefail
-    trap 'rm -rf "$temp_dir"' EXIT
-    curl --fail --location --silent --show-error --retry 5 --retry-delay 3 \
-      'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' \
-      -o "$temp_dir/awscliv2.zip"
-    unzip -q "$temp_dir/awscliv2.zip" -d "$temp_dir"
-    if [[ -d /usr/local/aws-cli/v2/current ]]; then
-      "$temp_dir/aws/install" --install-dir /usr/local/aws-cli \
-        --bin-dir /usr/local/bin --update
-    else
-      "$temp_dir/aws/install" --install-dir /usr/local/aws-cli \
-        --bin-dir /usr/local/bin
-    fi
-  )
-  [[ -x /usr/local/bin/aws ]] || die 'AWS CLI v2 executable not created.'
-  /usr/local/bin/aws --version 2>&1 | grep -qE '^aws-cli/2[.]' || \
-    die 'AWS CLI v2 verification failed.'
-  log "AWS CLI ready: $(/usr/local/bin/aws --version 2>&1)"
-}
-ensure_aws_cli_v2
-
-mkdir -p "$WORKSPACE" "$ARCHIVE_DIR"
+mkdir -p "$WORKSPACE"
 ESSENTIAL=(
   "$BUNDLE_ROOT/models/Qwen3-ASR-0.6B/model.safetensors"
   "$BUNDLE_ROOT/models/chatterbox-turbo/t3_turbo_v1.safetensors"
@@ -104,56 +45,29 @@ models_complete(){
   [[ -s "$BUNDLE_ROOT/manifest/SHA256SUMS" ]]
 }
 
-if models_complete; then
-  log 'Model files already extracted; reusing local bundle.'
-else
-  if [[ ! -s "$CACHE_ARCHIVE" ]]; then
-    if [[ -n "${MODEL_ARCHIVE_URL:-}" ]]; then
-      [[ -n "${MODEL_SHA_URL:-}" ]] || die 'MODEL_SHA_URL required with MODEL_ARCHIVE_URL.'
-      log 'Downloading private archive from presigned HTTPS URL'
-      curl -fL --retry 5 --retry-delay 5 "$MODEL_ARCHIVE_URL" -o "$CACHE_ARCHIVE"
-      curl -fL --retry 5 --retry-delay 5 "$MODEL_SHA_URL" -o "$CACHE_SHA"
-    else
-      log "Downloading ${MODEL_S3_URI} (requires read-only S3 IAM credentials)"
-      # Download to *.partial first. A broken network download must not be
-      # mistaken for a complete 9.9 GiB archive on the next provisioning run.
-      rm -f "${CACHE_ARCHIVE}.partial" "${CACHE_SHA}.partial"
-      s3_cp "$MODEL_S3_URI" "${CACHE_ARCHIVE}.partial"
-      mv "${CACHE_ARCHIVE}.partial" "$CACHE_ARCHIVE"
-      s3_cp "${MODEL_S3_URI}.sha256" "${CACHE_SHA}.partial"
-      mv "${CACHE_SHA}.partial" "$CACHE_SHA"
-    fi
-  elif [[ ! -s "$CACHE_SHA" ]]; then
-    if [[ -n "${MODEL_SHA_URL:-}" ]]; then
-      curl -fL --retry 5 "$MODEL_SHA_URL" -o "$CACHE_SHA"
-    else
-      s3_cp "${MODEL_S3_URI}.sha256" "${CACHE_SHA}.partial"
-      mv "${CACHE_SHA}.partial" "$CACHE_SHA"
-    fi
-  fi
-  log 'Verifying downloaded archive SHA256 before extracting'
-  (cd "$ARCHIVE_DIR" && sha256sum -c "$(basename "$CACHE_SHA")") || die 'Archive digest mismatch.'
-  if [[ -n "${MODEL_ARCHIVE_SHA256:-}" ]]; then
-    [[ "$(sha256sum "$CACHE_ARCHIVE" | awk '{print $1}')" == "$MODEL_ARCHIVE_SHA256" ]] || die 'Provided MODEL_ARCHIVE_SHA256 does not match archive.'
-  fi
-  if [[ -n "${MODEL_ARCHIVE_SIZE:-}" ]]; then
-    [[ "$(stat -c %s "$CACHE_ARCHIVE")" == "$MODEL_ARCHIVE_SIZE" ]] || die 'Provided MODEL_ARCHIVE_SIZE does not match downloaded bytes.'
-  fi
-  log 'Extracting prebuilt checkpoints and MuseTalk source (no Hugging Face downloads)'
-  tar --zstd -xf "$CACHE_ARCHIVE" -C "$WORKSPACE" --no-same-owner
-  models_complete || die 'Extracted archive missing expected checkpoints or manifest.'
-  log 'Verifying all inner checkpoint/file digests'
-  (cd "$BUNDLE_ROOT" && sha256sum -c manifest/SHA256SUMS >/dev/null) || die 'Inner bundle integrity validation failed.'
-  log 'Deleting downloaded 9.9 GiB compressed file after verified extraction'
-  rm -f "$CACHE_ARCHIVE" "$CACHE_SHA"
-fi
-
 log 'Ensuring uv Python bootstrap exists'
 BOOT_VENV="${WORKSPACE}/rosely-bootstrap-venv"
 if [[ ! -x "$BOOT_VENV/bin/uv" ]]; then
   python3 -m venv "$BOOT_VENV"
   "$BOOT_VENV/bin/python" -m pip install --upgrade pip uv
 fi
+"$BOOT_VENV/bin/python" -m pip install --quiet 'huggingface_hub>=0.34,<1'
+
+if models_complete; then
+  log 'Model files already present; reusing local bundle.'
+else
+  if [[ ! -s "$BUNDLE_ROOT/source/MuseTalk/requirements.txt" ]]; then
+    log "Fetching MuseTalk source ${MUSETALK_COMMIT:0:7} from GitHub"
+    mkdir -p "$BUNDLE_ROOT/source/MuseTalk"
+    curl -fsSL --retry 5 --retry-delay 3 \
+      "https://codeload.github.com/TMElyralab/MuseTalk/tar.gz/${MUSETALK_COMMIT}" |
+      tar xz -C "$BUNDLE_ROOT/source/MuseTalk" --strip-components=1
+  fi
+  log 'Downloading checkpoints from Hugging Face (pinned revisions, SHA256-verified)'
+  "$BOOT_VENV/bin/python" "$APP_DIR/fetch_models.py" "$BUNDLE_ROOT"
+  models_complete || die 'Hugging Face download finished but expected checkpoints are missing.'
+fi
+
 UV="$BOOT_VENV/bin/uv"
 "$UV" python install 3.10
 ENVS="${WORKSPACE}/rosely-venvs"
@@ -267,4 +181,4 @@ if [[ "${FETCH_BUILTIN_VOICES:-1}" == 1 ]]; then
 fi
 
 log 'Provisioned. Start via: sudo -E bash start_services.sh'
-log "Configuration at $ENV_FILE. Do not commit this file or AWS secrets."
+log "Configuration at $ENV_FILE. Do not commit this file or any tokens."

@@ -8,6 +8,7 @@ __pycache__/
 *.mp4
 *.tar.zst
 *.sha256
+!models.sha256
 models/
 logs/
 run/
