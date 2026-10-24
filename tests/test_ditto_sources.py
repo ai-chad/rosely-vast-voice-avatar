@@ -144,3 +144,25 @@ def test_warm_reports_unavailable_clips_without_failing(gateway, monkeypatch):
     body = gateway.WarmRequest(clips=[{'motion_sha256': 'b' * 64, 'motion_url': 'http://insecure/clip.mp4'}])
     result = asyncio.run(gateway.warm_clips(body, x_api_key='k'))
     assert result == {'ok': True, 'clips': {'b' * 12: 'unavailable'}}
+
+
+def test_offset_starts_the_clip_anywhere_and_stays_continuous(sources):
+    frames = 5
+    info = {'x_s_info_lst': [{'i': i} for i in range(frames)], 'f_s_lst': [np.full(1, i) for i in range(frames)],
+            'img_rgb_lst': list(range(frames)), 'sc': 'scalar', 'is_image_flag': False}
+    walk = [sources.mirror_index(k, frames) for k in range(12)]
+    assert walk == [0, 1, 2, 3, 4, 4, 3, 2, 1, 0, 0, 1]          # Ditto's own back-and-forth order
+    shifted = sources._fresh(info, offset=3)
+    assert shifted['img_rgb_lst'] == walk[3:3 + frames]           # starts at step 3 of the walk
+    assert [x['i'] for x in shifted['x_s_info_lst']] == walk[3:3 + frames]
+    assert [int(f[0]) for f in shifted['f_s_lst']] == walk[3:3 + frames]
+    assert shifted['sc'] == 'scalar' and info['img_rgb_lst'] == list(range(frames))   # cache untouched
+
+
+def test_offset_applies_to_one_setup_only(sources, tmp_path):
+    path, _ = clip(sources)
+    cache = sources.RegistrationCache(FakeRegistrar(), ram_items=2, disk_dir=None)
+    cache.next_offset = 1
+    first = cache(str(path), max_dim=1920, n_frames=10)
+    second = cache(str(path), max_dim=1920, n_frames=10)
+    assert np.allclose(first['f_s_lst'][0], 1.5) and np.allclose(second['f_s_lst'][0], 0.5)

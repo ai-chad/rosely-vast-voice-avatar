@@ -54,12 +54,29 @@ def store_clip(data: bytes, sha256: str) -> Path:
     return path
 
 
-def _fresh(info: dict) -> dict:
-    """Copy the parts Ditto may modify; share the large feature and frame arrays."""
+def mirror_index(index: int, size: int) -> int:
+    """Ditto's back-and-forth walk through source frames (0..n-1, n-1..0, ...)."""
+    turn, rest = divmod(index, size)
+    return rest if turn % 2 == 0 else size - rest - 1
+
+
+def _fresh(info: dict, offset: int = 0) -> dict:
+    """Copy the parts Ditto may modify; share the large feature and frame arrays.
+
+    offset > 0 starts the clip at that point of its back-and-forth walk, so a reply can
+    begin anywhere in the clip, and a reply's next sentence continues where the previous
+    one stopped. The reordered sequence stays continuous when Ditto loops it again.
+    """
     out = dict(info)
     for key in SMALL_KEYS:
         if key in out:
             out[key] = copy.deepcopy(out[key])
+    frames = len(info.get("x_s_info_lst") or [])
+    if offset and frames > 1:
+        order = [mirror_index(offset + k, frames) for k in range(frames)]
+        for key, value in out.items():
+            if isinstance(value, list) and len(value) == frames:
+                out[key] = [value[i] for i in order]
     return out
 
 
@@ -75,8 +92,10 @@ class RegistrationCache:
         self.ram: OrderedDict[str, dict] = OrderedDict()
         self.lock = threading.Lock()
         self.last = None  # "ram" | "disk" | "registered" | "uncached" for the latest call
+        self.next_offset = 0  # set by the renderer just before StreamSDK.setup; used once
 
     def __call__(self, source_path, max_dim=1920, n_frames=-1, **crop):
+        offset, self.next_offset = self.next_offset, 0
         path = Path(source_path)
         sha = path.stem
         if path.parent != clip_dir() or path.suffix != ".mp4" or not SHA_RE.fullmatch(sha):
@@ -87,7 +106,7 @@ class RegistrationCache:
             if key in self.ram:
                 self.ram.move_to_end(key)
                 self.last = "ram"
-                return _fresh(self.ram[key])
+                return _fresh(self.ram[key], offset)
         info = self._load_disk(key)
         if info is not None:
             self.last = "disk"
@@ -102,7 +121,7 @@ class RegistrationCache:
                 self.ram.move_to_end(key)
                 while len(self.ram) > self.ram_items:
                     self.ram.popitem(last=False)
-        return _fresh(info)
+        return _fresh(info, offset)
 
     def stats(self) -> dict:
         disk = sorted(self.disk_dir.glob("*.pkl")) if self.disk_dir and self.disk_dir.exists() else []

@@ -195,6 +195,8 @@ class GenerateAvatarRequest(BaseModel):
     motion_sha256: str | None = Field(default=None, pattern=r'^[0-9a-f]{64}$')
     motion_url: str | None = Field(default=None, max_length=4096)
     motion_base64: str | None = None
+    # Start point in the clip's back-and-forth walk (random per reply; continued per sentence).
+    motion_offset_frames: int = Field(default=0, ge=0, le=1_000_000)
 
 
 async def ensure_motion_clip(request: GenerateAvatarRequest) -> str | None:
@@ -233,14 +235,15 @@ async def ensure_clip(sha: str | None, url: str | None = None, inline: str | Non
 
 
 async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, gesture: str,
-                       motion_sha256: str | None = None) -> tuple[bytes, str] | None:
+                       motion_sha256: str | None = None, motion_offset: int = 0) -> tuple[bytes, str] | None:
     """(Ditto clip, source used), or None when this worker cannot render it (caller falls back to MuseTalk)."""
     if not DITTO_ENABLED or suffix not in {'.png', '.jpg', '.jpeg', '.webp'}:
         return None
     assert client is not None
     try:
         rendered = await client.post(DITTO_URL + '/v1/ditto/render', headers=internal_headers(),
-            data={'emotion': emotion, 'gesture': gesture, 'motion_sha256': motion_sha256 or ''},
+            data={'emotion': emotion, 'gesture': gesture, 'motion_sha256': motion_sha256 or '',
+                  'motion_offset_frames': str(motion_offset)},
             files={'image': ('character' + suffix, image, 'application/octet-stream'),
                    'audio': ('speech.wav', audio, 'audio/wav')})
     except httpx.HTTPError as exc:
@@ -329,7 +332,8 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
             audio = speech.content
         if request.engine == 'ditto':
             motion = await ensure_motion_clip(request)
-            result = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion)
+            result = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion,
+                                        request.motion_offset_frames)
             if result is not None:
                 video, source = result
                 return {'video_base64': base64.b64encode(video).decode('ascii'),

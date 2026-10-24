@@ -79,7 +79,8 @@ async def health():
             "source_cache": registrations.stats() if registrations else None}
 
 
-def render(source_path: Path, audio_path: Path, out_path: Path, emotion: str, gesture: str) -> dict:
+def render(source_path: Path, audio_path: Path, out_path: Path, emotion: str, gesture: str,
+           motion_offset: int = 0) -> dict:
     import librosa  # deferred: heavy import only in the render thread
     audio, _ = librosa.load(str(audio_path), sr=16000)
     seconds = len(audio) / 16000
@@ -89,6 +90,8 @@ def render(source_path: Path, audio_path: Path, out_path: Path, emotion: str, ge
     labels, ctrl = acting.controls(emotion, gesture, num_frames)
     silent = out_path.with_suffix(".silent.mp4")
     started = time.monotonic()
+    if registrations is not None:
+        registrations.next_offset = max(int(motion_offset), 0)
     sdk.setup(str(source_path), str(silent), emo=labels)
     sdk.setup_Nd(N_d=num_frames, ctrl_info=ctrl)
     sdk.audio2motion_queue.put(sdk.wav2feat.wav2feat(audio))
@@ -135,6 +138,7 @@ async def render_clip(
     emotion: str = Form("neutral"),
     gesture: str = Form("none"),
     motion_sha256: str = Form(""),
+    motion_offset_frames: int = Form(0),
     x_api_key: str | None = Header(default=None),
 ):
     authorize(x_api_key)
@@ -164,8 +168,8 @@ async def render_clip(
                 else:
                     LOG.warning("Motion clip %s missing; rendering the still portrait", motion_sha256[:12])
             try:
-                info = await asyncio.to_thread(render, source, work / "speech.wav",
-                                               work / "reply.mp4", emotion, gesture)
+                info = await asyncio.to_thread(render, source, work / "speech.wav", work / "reply.mp4",
+                                               emotion, gesture, motion_offset_frames if source_kind == "motion" else 0)
             except HTTPException:
                 raise
             except Exception as exc:
