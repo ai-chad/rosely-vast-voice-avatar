@@ -166,3 +166,15 @@ def test_offset_applies_to_one_setup_only(sources, tmp_path):
     first = cache(str(path), max_dim=1920, n_frames=10)
     second = cache(str(path), max_dim=1920, n_frames=10)
     assert np.allclose(first['f_s_lst'][0], 1.5) and np.allclose(second['f_s_lst'][0], 0.5)
+
+
+def test_clip_only_request_without_usable_clip_asks_for_the_portrait(gateway):
+    from fastapi import HTTPException
+    gateway.GATEWAY_API_KEY = 'k'
+    gateway.client = object()
+    for engine in ('musetalk', 'ditto'):   # no clip in the store -> never render from the placeholder
+        request = gateway.GenerateAvatarRequest(image_base64='', input='hi', engine=engine, motion_sha256='c' * 64)
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(gateway.generate_avatar(request, x_api_key='k'))
+        assert error.value.status_code == 409 and error.value.detail == gateway.IMAGE_REQUIRED
+    assert gateway.PLACEHOLDER_PNG[:8] == b'\x89PNG\r\n\x1a\n'

@@ -24,6 +24,10 @@ AVATAR_URL = f"http://127.0.0.1:{os.getenv('AVATAR_PORT', '8003')}"
 DITTO_ENABLED = os.getenv('DITTO_ENABLED', '0') == '1'
 DITTO_URL = f"http://127.0.0.1:{os.getenv('DITTO_PORT', '8005')}"
 MAX_MOTION_CLIP_BYTES = int(os.getenv('MAX_MOTION_CLIP_BYTES', str(30 * 1024 * 1024)))
+# Stand-in portrait for motion-clip renders (Ditto uses the clip, never this image).
+PLACEHOLDER_PNG = base64.b64decode(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==')
+IMAGE_REQUIRED = {'error': 'image_required'}
 VOICE_API_KEY = os.getenv('VOICE_API_KEY', '')
 GATEWAY_API_KEY = os.getenv('GATEWAY_API_KEY', VOICE_API_KEY)
 MAX_STT_AUDIO_BYTES = int(os.getenv('MAX_STT_AUDIO_BYTES', str(50*1024*1024)))
@@ -181,7 +185,8 @@ async def avatar_render(avatar_id: str = Form(...), audio: UploadFile = File(...
 
 class GenerateAvatarRequest(BaseModel):
     """One-request Serverless adapter. Multi-request prepared-avatar IDs are not durable across workers."""
-    image_base64: str = Field(min_length=1)
+    # May be empty when a motion clip is sent: Ditto then renders from the clip alone.
+    image_base64: str = ""
     audio_base64: str | None = None
     input: str | None = Field(default=None, max_length=2500)
     voice: str | None = None
@@ -297,18 +302,27 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
     assert client is not None
     if bool(request.audio_base64) == bool(request.input):
         raise HTTPException(400, 'provide exactly one of audio_base64 or input')
-    # Reject oversized b64 before materializing decoded files.
-    if len(request.image_base64) > ((MAX_AVATAR_FILE_BYTES + 2) // 3) * 4 + 16:
-        raise HTTPException(413, 'image too large')
-    try:
-        image = base64.b64decode(request.image_base64, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(400, 'invalid image_base64')
-    if not image or len(image) > MAX_AVATAR_FILE_BYTES:
-        raise HTTPException(413, 'empty or oversized image')
-    suffix = '.' + request.image_filename.rsplit('.', 1)[-1].lower() if '.' in request.image_filename else ''
-    if suffix not in {'.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.webm'}:
-        raise HTTPException(400, 'unsupported image_filename extension')
+    motion_ready = None
+    if not request.image_base64:
+        # Clip-only request (saves uploading the portrait each sentence). Without a usable
+        # clip, ask the caller to resend with the portrait instead of guessing.
+        motion_ready = await ensure_motion_clip(request) if request.engine == 'ditto' else None
+        if motion_ready is None:
+            raise HTTPException(409, IMAGE_REQUIRED)
+        image, suffix = PLACEHOLDER_PNG, '.png'
+    else:
+        # Reject oversized b64 before materializing decoded files.
+        if len(request.image_base64) > ((MAX_AVATAR_FILE_BYTES + 2) // 3) * 4 + 16:
+            raise HTTPException(413, 'image too large')
+        try:
+            image = base64.b64decode(request.image_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(400, 'invalid image_base64')
+        if not image or len(image) > MAX_AVATAR_FILE_BYTES:
+            raise HTTPException(413, 'empty or oversized image')
+        suffix = '.' + request.image_filename.rsplit('.', 1)[-1].lower() if '.' in request.image_filename else ''
+        if suffix not in {'.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.webm'}:
+            raise HTTPException(400, 'unsupported image_filename extension')
     # Content-addressed IDs prevent accidental collisions; cache is worker-local only.
     avatar_id = 's' + hashlib.sha256(image).hexdigest()[:24]
     async with gpu_request_lock:
@@ -331,7 +345,7 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
                 raise upstream_error('tts', speech)
             audio = speech.content
         if request.engine == 'ditto':
-            motion = await ensure_motion_clip(request)
+            motion = motion_ready or await ensure_motion_clip(request)
             result = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion,
                                         request.motion_offset_frames)
             if result is not None:
@@ -339,6 +353,8 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
                 return {'video_base64': base64.b64encode(video).decode('ascii'),
                         'content_type': 'video/mp4', 'size_bytes': len(video),
                         'avatar_id': avatar_id, 'engine': 'ditto', 'ditto_source': source}
+        if not request.image_base64:
+            raise HTTPException(409, IMAGE_REQUIRED)  # never render MuseTalk from the placeholder
         # Every serverless worker has its own local avatar cache.
         try:
             prepared = await client.post(AVATAR_URL + '/v1/avatar/prepare',
