@@ -15,12 +15,15 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+import ditto_sources
+
 ASR_URL = f"http://127.0.0.1:{os.getenv('ASR_PORT', '8001')}"
 TTS_URL = f"http://127.0.0.1:{os.getenv('TTS_PORT', '8002')}"
 AVATAR_URL = f"http://127.0.0.1:{os.getenv('AVATAR_PORT', '8003')}"
 # Ditto is opt-in per worker (DITTO_ENABLED=1); requests for it fall back to MuseTalk otherwise.
 DITTO_ENABLED = os.getenv('DITTO_ENABLED', '0') == '1'
 DITTO_URL = f"http://127.0.0.1:{os.getenv('DITTO_PORT', '8005')}"
+MAX_MOTION_CLIP_BYTES = int(os.getenv('MAX_MOTION_CLIP_BYTES', str(30 * 1024 * 1024)))
 VOICE_API_KEY = os.getenv('VOICE_API_KEY', '')
 GATEWAY_API_KEY = os.getenv('GATEWAY_API_KEY', VOICE_API_KEY)
 MAX_STT_AUDIO_BYTES = int(os.getenv('MAX_STT_AUDIO_BYTES', str(50*1024*1024)))
@@ -187,16 +190,54 @@ class GenerateAvatarRequest(BaseModel):
     engine: Literal['musetalk', 'ditto'] = 'musetalk'
     emotion: str = Field(default='neutral', max_length=32)
     gesture: str = Field(default='none', max_length=16)
+    # Optional pre-generated motion clip for Ditto (body/hands/head), identified by its sha256.
+    # Sent once per worker as an HTTPS URL or inline base64; later turns can send only the digest.
+    motion_sha256: str | None = Field(default=None, pattern=r'^[0-9a-f]{64}$')
+    motion_url: str | None = Field(default=None, max_length=4096)
+    motion_base64: str | None = None
 
 
-async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, gesture: str) -> bytes | None:
-    """Ditto clip, or None when this worker cannot render it (caller falls back to MuseTalk)."""
+async def ensure_motion_clip(request: GenerateAvatarRequest) -> str | None:
+    """Digest of the motion clip once it is in the local store, or None (render the still portrait)."""
+    sha = request.motion_sha256
+    if not sha or not DITTO_ENABLED:
+        return None
+    if ditto_sources.clip_path(sha).exists():
+        return sha
+    try:
+        if request.motion_base64:
+            if len(request.motion_base64) > ((MAX_MOTION_CLIP_BYTES + 2) // 3) * 4 + 16:
+                raise ValueError('motion clip too large')
+            data = base64.b64decode(request.motion_base64, validate=True)
+        elif request.motion_url and request.motion_url.startswith('https://'):
+            assert client is not None
+            async with client.stream('GET', request.motion_url, timeout=60) as response:
+                response.raise_for_status()
+                chunks, size = [], 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > MAX_MOTION_CLIP_BYTES:
+                        raise ValueError('motion clip too large')
+                    chunks.append(chunk)
+            data = b''.join(chunks)
+        else:
+            return None
+        await asyncio.to_thread(ditto_sources.store_clip, data, sha)
+        return sha
+    except Exception as exc:
+        print(f'[gateway] motion clip unavailable, using the still portrait: {type(exc).__name__}', flush=True)
+        return None
+
+
+async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, gesture: str,
+                       motion_sha256: str | None = None) -> tuple[bytes, str] | None:
+    """(Ditto clip, source used), or None when this worker cannot render it (caller falls back to MuseTalk)."""
     if not DITTO_ENABLED or suffix not in {'.png', '.jpg', '.jpeg', '.webp'}:
         return None
     assert client is not None
     try:
         rendered = await client.post(DITTO_URL + '/v1/ditto/render', headers=internal_headers(),
-            data={'emotion': emotion, 'gesture': gesture},
+            data={'emotion': emotion, 'gesture': gesture, 'motion_sha256': motion_sha256 or ''},
             files={'image': ('character' + suffix, image, 'application/octet-stream'),
                    'audio': ('speech.wav', audio, 'audio/wav')})
     except httpx.HTTPError as exc:
@@ -207,7 +248,7 @@ async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, ge
     if rendered.status_code >= 400:
         print(f'[gateway] Ditto failed ({rendered.status_code}), falling back to MuseTalk', flush=True)
         return None
-    return rendered.content
+    return rendered.content, rendered.headers.get('X-Ditto-Source', 'still')
 
 
 @app.post('/v1/avatar/generate')
@@ -250,11 +291,13 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
                 raise upstream_error('tts', speech)
             audio = speech.content
         if request.engine == 'ditto':
-            video = await render_ditto(image, suffix, audio, request.emotion, request.gesture)
-            if video is not None:
+            motion = await ensure_motion_clip(request)
+            result = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion)
+            if result is not None:
+                video, source = result
                 return {'video_base64': base64.b64encode(video).decode('ascii'),
                         'content_type': 'video/mp4', 'size_bytes': len(video),
-                        'avatar_id': avatar_id, 'engine': 'ditto'}
+                        'avatar_id': avatar_id, 'engine': 'ditto', 'ditto_source': source}
         # Every serverless worker has its own local avatar cache.
         try:
             prepared = await client.post(AVATAR_URL + '/v1/avatar/prepare',
