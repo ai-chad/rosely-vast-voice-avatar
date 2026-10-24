@@ -199,19 +199,22 @@ class GenerateAvatarRequest(BaseModel):
 
 async def ensure_motion_clip(request: GenerateAvatarRequest) -> str | None:
     """Digest of the motion clip once it is in the local store, or None (render the still portrait)."""
-    sha = request.motion_sha256
+    return await ensure_clip(request.motion_sha256, request.motion_url, request.motion_base64)
+
+
+async def ensure_clip(sha: str | None, url: str | None = None, inline: str | None = None) -> str | None:
     if not sha or not DITTO_ENABLED:
         return None
     if ditto_sources.clip_path(sha).exists():
         return sha
     try:
-        if request.motion_base64:
-            if len(request.motion_base64) > ((MAX_MOTION_CLIP_BYTES + 2) // 3) * 4 + 16:
+        if inline:
+            if len(inline) > ((MAX_MOTION_CLIP_BYTES + 2) // 3) * 4 + 16:
                 raise ValueError('motion clip too large')
-            data = base64.b64decode(request.motion_base64, validate=True)
-        elif request.motion_url and request.motion_url.startswith('https://'):
+            data = base64.b64decode(inline, validate=True)
+        elif url and url.startswith('https://'):
             assert client is not None
-            async with client.stream('GET', request.motion_url, timeout=60) as response:
+            async with client.stream('GET', url, timeout=60) as response:
                 response.raise_for_status()
                 chunks, size = [], 0
                 async for chunk in response.aiter_bytes():
@@ -249,6 +252,40 @@ async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, ge
         print(f'[gateway] Ditto failed ({rendered.status_code}), falling back to MuseTalk', flush=True)
         return None
     return rendered.content, rendered.headers.get('X-Ditto-Source', 'still')
+
+
+class WarmClip(BaseModel):
+    motion_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    motion_url: str | None = Field(default=None, max_length=4096)
+
+
+class WarmRequest(BaseModel):
+    clips: list[WarmClip] = Field(default_factory=list, max_length=8)
+
+
+@app.post('/v1/ditto/warm')
+async def warm_clips(request: WarmRequest, x_api_key: str | None = Header(default=None)):
+    """Download and pre-register a character's motion clips before its next replies need them.
+
+    Clips are registered one at a time and the GPU lock is released between them,
+    so a real turn never waits behind a whole batch.
+    """
+    authorize(x_api_key)
+    assert client is not None
+    results = {}
+    for clip in request.clips:
+        sha = await ensure_clip(clip.motion_sha256, clip.motion_url)
+        if sha is None:
+            results[clip.motion_sha256[:12]] = 'unavailable'
+            continue
+        async with gpu_request_lock:
+            try:
+                warmed = await client.post(DITTO_URL + '/v1/ditto/warm', headers=internal_headers(),
+                                           data={'motion_sha256': sha})
+                results[sha[:12]] = warmed.json().get('cache') if warmed.status_code == 200 else f'http {warmed.status_code}'
+            except httpx.HTTPError as exc:
+                results[sha[:12]] = f'error {type(exc).__name__}'
+    return {'ok': True, 'clips': results}
 
 
 @app.post('/v1/avatar/generate')

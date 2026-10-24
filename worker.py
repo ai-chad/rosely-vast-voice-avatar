@@ -22,6 +22,9 @@ worker_config = WorkerConfig(
             max_queue_time=180.0, workload_calculator=lambda payload: 1.0),
         HandlerConfig(route='/v1/avatar/generate', allow_parallel_requests=False,
             max_queue_time=900.0, workload_calculator=lambda payload: 20.0),
+        # Pre-registers a character's motion clips when a video chat opens.
+        HandlerConfig(route='/v1/ditto/warm', allow_parallel_requests=False,
+            max_queue_time=300.0, workload_calculator=lambda payload: 5.0),
     ],
     log_action_config=LogActionConfig(
         on_load=['Application startup complete.'],

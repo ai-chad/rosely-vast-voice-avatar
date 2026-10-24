@@ -48,7 +48,7 @@ def load_sdk():
     global registrations
     registrations = ditto_sources.RegistrationCache(
         loaded.avatar_registrar,
-        ram_items=int(os.getenv("DITTO_SOURCE_CACHE_RAM", "3")),
+        ram_items=int(os.getenv("DITTO_SOURCE_CACHE_RAM", "4")),  # one per clip type
         disk_dir=Path(os.getenv("DITTO_SOURCE_CACHE_DIR", str(ditto_sources._media_root() / "ditto-cache"))),
         disk_bytes=float(os.getenv("DITTO_SOURCE_CACHE_DISK_GB", "20")) * 1e9,
     )
@@ -99,6 +99,33 @@ def render(source_path: Path, audio_path: Path, out_path: Path, emotion: str, ge
                    check=True, timeout=120)
     return {"seconds": round(seconds, 2), "render_seconds": round(took, 2), "frames": num_frames,
             "cache": registrations.last if registrations else None}
+
+
+def registration_kwargs() -> dict:
+    """The registrar arguments StreamSDK.setup uses, so a warmed clip hits the same cache entry."""
+    kw = sdk._merge_kwargs(sdk.default_kwargs, {})
+    return {"max_dim": kw.get("max_size", 1920), "crop_scale": kw.get("crop_scale", 2.3),
+            "crop_vx_ratio": kw.get("crop_vx_ratio", 0), "crop_vy_ratio": kw.get("crop_vy_ratio", -0.125),
+            "crop_flag_do_rot": kw.get("crop_flag_do_rot", True)}
+
+
+@app.post("/v1/ditto/warm")
+async def warm(motion_sha256: str = Form(...), x_api_key: str | None = Header(default=None)):
+    authorize(x_api_key)
+    if sdk is None or registrations is None:
+        raise HTTPException(503, "Ditto models are still loading")
+    try:
+        clip = ditto_sources.clip_path(motion_sha256)
+    except ValueError:
+        raise HTTPException(400, "invalid motion_sha256") from None
+    if not clip.exists():
+        raise HTTPException(404, "motion clip not in the local store")
+    async with render_lock:
+        started = time.monotonic()
+        await asyncio.to_thread(registrations, str(clip), n_frames=-1, **registration_kwargs())
+        LOG.info("ditto_warm clip=%s cache=%s seconds=%.2f", motion_sha256[:12], registrations.last,
+                 time.monotonic() - started)
+        return {"ok": True, "cache": registrations.last}
 
 
 @app.post("/v1/ditto/render")

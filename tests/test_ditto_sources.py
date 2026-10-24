@@ -128,3 +128,19 @@ def test_gateway_falls_back_to_the_still_portrait(gateway):
 def test_gateway_rejects_malformed_digests(gateway):
     with pytest.raises(Exception):
         request(gateway, motion_sha256='not-a-digest')
+
+
+def test_warm_request_validation(gateway):
+    with pytest.raises(Exception):
+        gateway.WarmRequest(clips=[{'motion_sha256': 'nope'}])
+    with pytest.raises(Exception):
+        gateway.WarmRequest(clips=[{'motion_sha256': 'a' * 64}] * 9)
+    assert len(gateway.WarmRequest(clips=[{'motion_sha256': 'a' * 64}]).clips) == 1
+
+
+def test_warm_reports_unavailable_clips_without_failing(gateway, monkeypatch):
+    gateway.GATEWAY_API_KEY = 'k'
+    gateway.client = object()  # never reached: no clip can be fetched
+    body = gateway.WarmRequest(clips=[{'motion_sha256': 'b' * 64, 'motion_url': 'http://insecure/clip.mp4'}])
+    result = asyncio.run(gateway.warm_clips(body, x_api_key='k'))
+    assert result == {'ok': True, 'clips': {'b' * 12: 'unavailable'}}

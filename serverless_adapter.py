@@ -36,6 +36,7 @@ async def health():
 @app.post('/v1/tts')
 @app.post('/v1/stt')
 @app.post('/v1/avatar/generate')
+@app.post('/v1/ditto/warm')
 async def proxy(request: Request):
     if not SECRET:
         raise HTTPException(503, 'missing internal gateway key')
