@@ -9,6 +9,7 @@ __pycache__/
 *.tar.zst
 *.sha256
 !models.sha256
+!ditto_models.sha256
 models/
 logs/
 run/

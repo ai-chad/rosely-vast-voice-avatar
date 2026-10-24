@@ -8,6 +8,7 @@ ENV_FILE="${WORKSPACE}/rosely-voice-avatar.env"
 source "$ENV_FILE"
 export VOICE_API_KEY GATEWAY_API_KEY BUNDLE_ROOT ASR_MODEL_PATH TTS_MODEL_PATH VOICES_DIR \
   AVATAR_MEDIA_ROOT MUSE_PYTHON ASR_PORT TTS_PORT AVATAR_PORT GATEWAY_PORT MUSE_BATCH_SIZE
+export DITTO_ENABLED="${DITTO_ENABLED:-0}" DITTO_PORT="${DITTO_PORT:-8005}" DITTO_ROOT DITTO_MODELS
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_MODULE_LOADING=LAZY
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
@@ -39,7 +40,7 @@ wait_health(){
   tail -n 120 "$logfile" >&2 || true
   exit 1
 }
-for name in gateway avatar tts asr; do stop_pid "$RUN/$name.pid"; done
+for name in gateway ditto avatar tts asr; do stop_pid "$RUN/$name.pid"; done
 sleep 2
 start_api(){
   local name="$1" envname="$2" module="$3" bind="$4" port="$5"
@@ -53,6 +54,11 @@ start_api(){
 start_api asr asr asr_server 127.0.0.1 "$ASR_PORT"
 start_api tts tts tts_server 127.0.0.1 "$TTS_PORT"
 start_api avatar muse avatar_server 127.0.0.1 "$AVATAR_PORT"
+if [[ "$DITTO_ENABLED" == 1 ]]; then
+  # TensorRT 8.6.1 needs the cuDNN 8 kept private to the Ditto environment.
+  (export LD_LIBRARY_PATH="${DITTO_CUDNN8_DIR}:${LD_LIBRARY_PATH:-}"
+   start_api ditto ditto ditto_server 127.0.0.1 "$DITTO_PORT") || exit 1
+fi
 start_api gateway asr voice_gateway 0.0.0.0 "$GATEWAY_PORT"
 echo '[Rosely] All three model services and authenticated gateway are online.'
 nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv || true

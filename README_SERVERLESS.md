@@ -31,6 +31,7 @@ Upload the extracted contents at the root of the repo (not the parent folder), s
 - `PROVISIONING_SCRIPT=https://raw.githubusercontent.com/ai-chad/rosely-vast-voice-avatar/main/provision_serverless.sh`
 - `HUGGINGFACE_TOKEN`: a **read-only** Hugging Face token. All model repos are public; the token avoids anonymous rate limits. Put it only in a **private Vast template**, never git. (`HF_TOKEN` is accepted as a fallback.) No S3 or AWS credentials are needed.
 - `MUSE_BATCH_SIZE=4`, `FETCH_BUILTIN_VOICES=1`
+- Optional `ENABLE_DITTO=1`: also installs the Ditto talking-head engine (see below).
 
 Use a purpose-specific CUDA/base image rather than ComfyUI; this does not run ComfyUI, and **do not set `BACKEND=comfyui-json`**. Also do not use the `-e AWS_ZIT_IMAGE_*` vars, which these scripts do not read.
 
@@ -43,6 +44,12 @@ Use a purpose-specific CUDA/base image rather than ComfyUI; this does not run Co
 5. PyWorker benchmarks the TTS route (short input) and announces readiness via Vast.
 
 The first provisioning can be lengthy because it installs CUDA, PyTorch and MMLab dependencies; the ~12 GB Hugging Face download itself took about 3 minutes on a Vast RTX 3090 host. A prebuilt derivative Docker image is preferable once inference has been validated.
+
+### Optional Ditto engine (dev)
+
+With `ENABLE_DITTO=1`, provisioning runs `provision_ditto.sh`: Ditto source at a pinned commit, its TensorRT checkpoints from Hugging Face (pinned revision, verified against `ditto_models.sha256`), and an isolated `rosely-venvs/ditto` environment (`requirements-ditto.txt`, TensorRT 8.6.1 with a private cuDNN 8). `start_services.sh` then starts `ditto_server.py` on loopback `8005` (~2.6 GB VRAM, resident).
+
+`/v1/avatar/generate` accepts `engine: "ditto"` with `emotion` (the chat reply's voice_style) and `gesture` (`none`, `nod`, `shake`, `tilt`, `wink`). Ditto animates the whole portrait (head motion, blinks, expression) instead of only the mouth; `acting.py` maps emotion and gesture to Ditto controls. Without Ditto, or if it fails, the same request renders with MuseTalk, and the response's `engine` field says which one ran. Measured on an RTX 3090: about 4–9 s per reply including TTS, against roughly 80 s for MuseTalk's prepare + render.
 
 ### Vast endpoint
 

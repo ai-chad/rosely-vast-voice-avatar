@@ -4,7 +4,8 @@ Revisions are pinned and every file is checked against models.sha256, so a fresh
 worker gets exactly the bytes the services were validated with. Files that
 already match are skipped, so re-running after a partial download resumes.
 
-Usage: python fetch_models.py BUNDLE_ROOT
+Usage: python fetch_models.py BUNDLE_ROOT [--ditto]
+  --ditto fetches the opt-in Ditto TensorRT set instead (ditto_models.sha256).
 Token: HUGGINGFACE_TOKEN (or HF_TOKEN). All repos are public; the token avoids
 anonymous rate limits. It is never printed.
 """
@@ -40,6 +41,14 @@ SOURCES = [
     ("ManyOtherFunctions/face-parse-bisent", "0073b233a5a3c4b1377d4dbf49245017938a72b5", f"{MUSE}/face-parse-bisent", [
         "79999_iter.pth", "resnet18-5c106cde.pth"]),
 ]
+# Opt-in Ditto talking-head engine (TensorRT engines built for Ampere and newer).
+DITTO_ENGINES = ["appearance_extractor_fp16", "blaze_face_fp16", "decoder_fp16", "face_mesh_fp16", "hubert_fp32",
+                 "insightface_det_fp16", "landmark106_fp16", "landmark203_fp16", "lmdm_v0.4_hubert_fp32",
+                 "motion_extractor_fp32", "stitch_network_fp16", "warp_network_fp16"]
+DITTO_SOURCES = [
+    ("digital-avatar/ditto-talkinghead", "e4a2f60328ee7c32af585ac4b3cce299e4c8e254", "models/ditto", [
+        "ditto_cfg/v0.4_hubert_cfg_trt.pkl", *(f"ditto_trt_Ampere_Plus/{e}.engine" for e in DITTO_ENGINES)]),
+]
 
 
 def sha256(path):
@@ -50,9 +59,10 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def main(bundle_root):
+def main(bundle_root, ditto=False):
+    sources = DITTO_SOURCES if ditto else SOURCES
     root = Path(bundle_root)
-    manifest = Path(__file__).with_name("models.sha256")
+    manifest = Path(__file__).with_name("ditto_models.sha256" if ditto else "models.sha256")
     expected = {}
     for line in manifest.read_text().splitlines():
         if line.strip():
@@ -62,7 +72,7 @@ def main(bundle_root):
     print(f"[models] Hugging Face token {'provided' if token else 'not set (anonymous)'}", flush=True)
 
     listed = set()
-    for repo, revision, local_dir, files in SOURCES:
+    for repo, revision, local_dir, files in sources:
         for name in files:
             rel = f"{local_dir}/{name}"
             listed.add(rel)
@@ -85,14 +95,15 @@ def main(bundle_root):
     if missing:
         sys.exit(f"[models] models.sha256 lists files with no source: {sorted(missing)}")
     # hf_hub_download keeps per-directory download metadata; it is not needed at runtime.
-    for _, _, local_dir, _ in SOURCES:
+    for _, _, local_dir, _ in sources:
         shutil.rmtree(root / local_dir / ".cache", ignore_errors=True)
     (root / "manifest").mkdir(exist_ok=True)
-    shutil.copyfile(manifest, root / "manifest" / "SHA256SUMS")
+    shutil.copyfile(manifest, root / "manifest" / ("DITTO_SHA256SUMS" if ditto else "SHA256SUMS"))
     print(f"[models] all {len(expected)} files verified in {root}", flush=True)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python fetch_models.py BUNDLE_ROOT")
-    main(sys.argv[1])
+    args = [a for a in sys.argv[1:] if a != "--ditto"]
+    if len(args) != 1:
+        sys.exit("usage: python fetch_models.py BUNDLE_ROOT [--ditto]")
+    main(args[0], ditto="--ditto" in sys.argv[1:])

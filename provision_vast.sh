@@ -134,7 +134,7 @@ if [[ ! -e "$ENVS/muse/.rosely_installed" ]]; then
 fi
 
 log 'Checking service source code syntax'
-for entry in asr_server.py tts_server.py voice_gateway.py avatar_server.py; do
+for entry in asr_server.py tts_server.py voice_gateway.py avatar_server.py ditto_server.py acting.py; do
   "$ENVS/asr/bin/python" -m py_compile "$APP_DIR/$entry"
 done
 
@@ -178,6 +178,10 @@ if [[ "${FETCH_BUILTIN_VOICES:-1}" == 1 ]]; then
       rm -f "$tmp"
     done
   done
+fi
+
+if [[ "${ENABLE_DITTO:-0}" == 1 ]]; then
+  bash "$APP_DIR/provision_ditto.sh"
 fi
 
 log 'Provisioned. Start via: sudo -E bash start_services.sh'

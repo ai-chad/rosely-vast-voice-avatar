@@ -8,6 +8,7 @@ import hashlib
 import re
 import os
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -17,6 +18,9 @@ from pydantic import BaseModel, Field
 ASR_URL = f"http://127.0.0.1:{os.getenv('ASR_PORT', '8001')}"
 TTS_URL = f"http://127.0.0.1:{os.getenv('TTS_PORT', '8002')}"
 AVATAR_URL = f"http://127.0.0.1:{os.getenv('AVATAR_PORT', '8003')}"
+# Ditto is opt-in per worker (DITTO_ENABLED=1); requests for it fall back to MuseTalk otherwise.
+DITTO_ENABLED = os.getenv('DITTO_ENABLED', '0') == '1'
+DITTO_URL = f"http://127.0.0.1:{os.getenv('DITTO_PORT', '8005')}"
 VOICE_API_KEY = os.getenv('VOICE_API_KEY', '')
 GATEWAY_API_KEY = os.getenv('GATEWAY_API_KEY', VOICE_API_KEY)
 MAX_STT_AUDIO_BYTES = int(os.getenv('MAX_STT_AUDIO_BYTES', str(50*1024*1024)))
@@ -77,10 +81,11 @@ class TTSRequest(BaseModel):
 @app.get('/health')
 async def health():
     assert client is not None
-    statuses = await asyncio.gather(*(client.get(url + '/health') for url in (ASR_URL, TTS_URL, AVATAR_URL)),
+    upstreams = {'asr': ASR_URL, 'tts': TTS_URL, 'avatar': AVATAR_URL, **({'ditto': DITTO_URL} if DITTO_ENABLED else {})}
+    statuses = await asyncio.gather(*(client.get(url + '/health') for url in upstreams.values()),
                                     return_exceptions=True)
     services = {}
-    for name, result in zip(('asr', 'tts', 'avatar'), statuses):
+    for name, result in zip(upstreams, statuses):
         if isinstance(result, BaseException):
             services[name] = {'ok': False, 'error': type(result).__name__}
         elif result.status_code != 200:
@@ -178,6 +183,31 @@ class GenerateAvatarRequest(BaseModel):
     input: str | None = Field(default=None, max_length=2500)
     voice: str | None = None
     image_filename: str = "character.png"
+    # Optional Ditto engine with per-reply acting controls (see acting.py).
+    engine: Literal['musetalk', 'ditto'] = 'musetalk'
+    emotion: str = Field(default='neutral', max_length=32)
+    gesture: str = Field(default='none', max_length=16)
+
+
+async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, gesture: str) -> bytes | None:
+    """Ditto clip, or None when this worker cannot render it (caller falls back to MuseTalk)."""
+    if not DITTO_ENABLED or suffix not in {'.png', '.jpg', '.jpeg', '.webp'}:
+        return None
+    assert client is not None
+    try:
+        rendered = await client.post(DITTO_URL + '/v1/ditto/render', headers=internal_headers(),
+            data={'emotion': emotion, 'gesture': gesture},
+            files={'image': ('character' + suffix, image, 'application/octet-stream'),
+                   'audio': ('speech.wav', audio, 'audio/wav')})
+    except httpx.HTTPError as exc:
+        print(f'[gateway] Ditto unreachable, falling back to MuseTalk: {type(exc).__name__}', flush=True)
+        return None
+    if rendered.status_code == 413:
+        raise upstream_error('ditto', rendered)
+    if rendered.status_code >= 400:
+        print(f'[gateway] Ditto failed ({rendered.status_code}), falling back to MuseTalk', flush=True)
+        return None
+    return rendered.content
 
 
 @app.post('/v1/avatar/generate')
@@ -219,6 +249,12 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
             if speech.status_code >= 400:
                 raise upstream_error('tts', speech)
             audio = speech.content
+        if request.engine == 'ditto':
+            video = await render_ditto(image, suffix, audio, request.emotion, request.gesture)
+            if video is not None:
+                return {'video_base64': base64.b64encode(video).decode('ascii'),
+                        'content_type': 'video/mp4', 'size_bytes': len(video),
+                        'avatar_id': avatar_id, 'engine': 'ditto'}
         # Every serverless worker has its own local avatar cache.
         try:
             prepared = await client.post(AVATAR_URL + '/v1/avatar/prepare',
@@ -239,4 +275,4 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
         # For short POC videos only. Production should upload MP4 to S3 and return a signed URL.
         return {'video_base64': base64.b64encode(rendered.content).decode('ascii'),
                 'content_type': 'video/mp4', 'size_bytes': len(rendered.content),
-                'avatar_id': avatar_id}
+                'avatar_id': avatar_id, 'engine': 'musetalk'}
