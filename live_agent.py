@@ -5,7 +5,10 @@ The backend mints the room tokens and asks this worker to join (gateway route
   user microphone -> voice activity turns -> local ASR -> backend turn (character
   LLM, policy, history, per-reply billing) -> local TTS per sentence -> Ditto
   online stream (video) -> LiveKit audio + video tracks, kept in sync.
-Between replies the call shows the still portrait. Speaking over the character
+Between replies the call shows the still portrait. With the character's motion
+clips (sent at join, registered in the background), each reply streams from the
+clip its emotion calls for, from the clip's first frame (the portrait it was made
+from), so body and hands move as in turn-based video. Speaking over the character
 stops it (barge-in). One call at a time per worker: it owns the streaming renderer.
 Nothing here holds LiveKit or backend credentials beyond the per-call token and secret.
 """
@@ -18,6 +21,7 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,7 +32,8 @@ import numpy as np
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-import live_ditto  # imported before load_sdk() changes the working directory
+import ditto_sources  # these imports happen before load_sdk() changes the working directory
+import live_ditto
 import live_media
 from live_media import OUT_RATE, ReplyTimeline, TurnDetector
 
@@ -36,6 +41,7 @@ LOG = logging.getLogger("uvicorn.error")
 API_KEY = os.environ.get("VOICE_API_KEY", "")
 ASR_URL = f"http://127.0.0.1:{os.getenv('ASR_PORT', '8001')}"
 TTS_URL = f"http://127.0.0.1:{os.getenv('TTS_PORT', '8002')}"
+DITTO_URL = f"http://127.0.0.1:{os.getenv('DITTO_PORT', '8005')}"
 BUNDLE_ROOT = Path(os.getenv("BUNDLE_ROOT", "/workspace/rosely-voice-musetalk-v1"))
 DITTO_ROOT = Path(os.getenv("DITTO_ROOT", str(BUNDLE_ROOT / "source" / "ditto-talkinghead")))
 DITTO_MODELS = Path(os.getenv("DITTO_MODELS", str(BUNDLE_ROOT / "models" / "ditto")))
@@ -46,9 +52,13 @@ START_BUFFER_S = float(os.getenv("LIVE_START_BUFFER_S", "0.15"))  # Ditto render
 JOIN_TIMEOUT_S = 60  # the caller must appear in the room within this
 IDLE_TIMEOUT_S = int(os.getenv("LIVE_IDLE_TIMEOUT_S", "600"))
 BARGE_IN_MS = 420  # speech needed to interrupt the character (echo-safe margin)
+RENDER_STALL_S = 10  # a reply whose first frame has not played by then is dropped
 VOICE_ONLY = object()  # stands in for a video frame in voice calls
+CLIP_ORDER = ("talk", "playful", "flirty", "shy")  # registered in this order; talk is every mood's fallback
+MAX_CLIP_BYTES = int(os.getenv("MAX_MOTION_CLIP_BYTES", str(30 * 1024 * 1024)))
 
 sdk = None
+registrations: ditto_sources.RegistrationCache | None = None
 active: "CallSession | None" = None
 http: httpx.AsyncClient | None = None
 
@@ -58,13 +68,43 @@ def authorize(key: str | None) -> None:
         raise HTTPException(401, "invalid API key")
 
 
+class _LockedRegistrar:
+    """One avatar registration at a time: the background clip warm-up and a reply's setup
+    share the same TensorRT registration models."""
+
+    def __init__(self, registrar):
+        self.registrar, self.lock = registrar, threading.Lock()
+
+    def __call__(self, *args, **kwargs):
+        with self.lock:
+            return self.registrar(*args, **kwargs)
+
+
 def load_sdk():
     import sys
     sys.path.insert(0, str(DITTO_ROOT))
     os.chdir(DITTO_ROOT)
     from stream_pipeline_online import StreamSDK
-    return StreamSDK(str(DITTO_MODELS / "ditto_cfg" / "v0.4_hubert_cfg_trt_online.pkl"),
-                     str(DITTO_MODELS / "ditto_trt_Ampere_Plus"))
+    loaded = StreamSDK(str(DITTO_MODELS / "ditto_cfg" / "v0.4_hubert_cfg_trt_online.pkl"),
+                       str(DITTO_MODELS / "ditto_trt_Ampere_Plus"))
+    global registrations
+    # Same disk cache as ditto_server: clips it already warmed load in seconds instead of ~7 s.
+    registrations = ditto_sources.RegistrationCache(
+        _LockedRegistrar(loaded.avatar_registrar),
+        ram_items=int(os.getenv("LIVE_CLIP_CACHE_RAM", "4")),  # one call's clips (~2.3 GB each)
+        disk_dir=Path(os.getenv("DITTO_SOURCE_CACHE_DIR", str(ditto_sources._media_root() / "ditto-cache"))),
+        disk_bytes=float(os.getenv("DITTO_SOURCE_CACHE_DISK_GB", "20")) * 1e9,
+    )
+    loaded.avatar_registrar = registrations
+    return loaded
+
+
+def registration_kwargs() -> dict:
+    """The registrar arguments StreamSDK.setup uses, so a warmed clip hits the same cache entry."""
+    kw = sdk._merge_kwargs(dict(sdk.default_kwargs), {})
+    return {"max_dim": kw.get("max_size", 1920), "crop_scale": kw.get("crop_scale", 2.3),
+            "crop_vx_ratio": kw.get("crop_vx_ratio", 0), "crop_vy_ratio": kw.get("crop_vy_ratio", -0.125),
+            "crop_flag_do_rot": kw.get("crop_flag_do_rot", True)}
 
 
 @asynccontextmanager
@@ -85,6 +125,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Rosely Live Call Agent", version="0.1.0", lifespan=lifespan)
 
 
+class MotionClip(BaseModel):
+    clip_type: str = Field(pattern=r"^[a-z_]{1,32}$")
+    motion_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    motion_url: str = Field(pattern=r"^https://", max_length=4096)
+
+
 class JoinRequest(BaseModel):
     call_id: str = Field(pattern=r"^[0-9a-f-]{36}$")
     mode: Literal["voice", "video"] = "video"
@@ -97,11 +143,13 @@ class JoinRequest(BaseModel):
     voice_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")
     language: str | None = None
     max_seconds: int = Field(default=1800, ge=60, le=7200)
+    motion_clips: list[MotionClip] = Field(default_factory=list, max_length=8)
 
 
 @app.get("/health")
 async def health():
-    return {"ok": sdk is not None, "service": "live-agent", "busy": bool(active and not active.finished)}
+    return {"ok": sdk is not None, "service": "live-agent", "busy": bool(active and not active.finished),
+            "clip_cache": registrations.stats() if registrations else None}
 
 
 @app.post("/v1/live/join")
@@ -138,6 +186,8 @@ class CallSession:
         self.renderer_idle = asyncio.Event()  # the streaming renderer is free for the next reply
         self.renderer_idle.set()
         self.portrait_path: Path | None = None
+        self.clip_paths: dict[str, Path] = {}  # registered motion clips by type, ready for replies
+        self.in_turn = False  # a turn is between end-of-speech and the end of the reply
         self.idle_rgb: np.ndarray | None = None
         self.room = None
         self.av = None
@@ -198,6 +248,8 @@ class CallSession:
             def _disconnected(*_):
                 self.stop("room_closed")
 
+            if self.video and self.request.motion_clips:
+                tasks.append(asyncio.create_task(self.prepare_clips()))  # loads while the room connects
             await room.connect(self.request.livekit_url, self.request.token, rtc.RoomOptions(auto_subscribe=True))
             audio_source = rtc.AudioSource(OUT_RATE, 1, queue_size_ms=200)
             await room.local_participant.publish_track(
@@ -207,9 +259,12 @@ class CallSession:
             if self.video:
                 h, w = self.idle_rgb.shape[:2]
                 video_source = rtc.VideoSource(w, h)
+                # One viewer per call: a single full-resolution layer, not simulcast's smaller ones.
                 await room.local_participant.publish_track(
                     rtc.LocalVideoTrack.create_video_track("avatar", video_source),
-                    rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA))
+                    rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA, simulcast=False,
+                                            video_encoding=rtc.VideoEncoding(max_bitrate=1_500_000,
+                                                                             max_framerate=self.fps)))
                 self.av = rtc.AVSynchronizer(audio_source=audio_source, video_source=video_source,
                                              video_fps=self.fps)
             tasks.append(asyncio.create_task(self.media_loop(rtc, audio_source)))
@@ -237,6 +292,64 @@ class CallSession:
             if self.portrait_path:
                 self.portrait_path.unlink(missing_ok=True)
             LOG.info("live_call_ended call_id=%s reason=%s turns=%d", self.request.call_id, self.end_reason, self.seq)
+
+    async def prepare_clips(self):
+        """Fetch the character's motion clips and load their registrations from the shared disk
+        cache, talk first, starting as the call connects (CPU only, so it runs during turns too).
+        A clip that is not cached yet is registered by the turn renderer (ditto_server, its own
+        process) between turns, so this process never does GPU registration next to the live stream."""
+        rank = {clip_type: i for i, clip_type in enumerate(CLIP_ORDER)}
+        for clip in sorted(self.request.motion_clips, key=lambda c: rank.get(c.clip_type, len(rank))):
+            try:
+                path = await self.fetch_clip(clip)
+                started = time.monotonic()
+                kwargs = registration_kwargs()
+                if registrations.cached(path, **kwargs) is None:
+                    await self.warm_in_renderer(clip.motion_sha256, path, kwargs)
+                if registrations.cached(path, **kwargs) is None:
+                    raise RuntimeError("registration not cached")
+                await asyncio.to_thread(registrations, str(path), n_frames=-1, **kwargs)
+                self.clip_paths[clip.clip_type] = path
+                LOG.info("live_clip_ready call_id=%s type=%s cache=%s seconds=%.2f", self.request.call_id,
+                         clip.clip_type, registrations.last, time.monotonic() - started)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # replies fall back to talk, then the still portrait
+                LOG.warning("live_clip_unavailable call_id=%s type=%s error=%s", self.request.call_id,
+                            clip.clip_type, type(exc).__name__)
+
+    async def warm_in_renderer(self, sha256: str, path: Path, kwargs: dict):
+        """Have ditto_server register the clip (it saves the registration to the shared disk cache)."""
+        while self.in_turn or self.speaking:  # its GPU work slows the live stream; start it between turns
+            await asyncio.sleep(0.2)
+        response = await http.post(DITTO_URL + "/v1/ditto/warm", headers={"X-API-Key": API_KEY},
+                                   data={"motion_sha256": sha256}, timeout=120)
+        response.raise_for_status()
+        for _ in range(120):  # the disk copy is written in the background after registration
+            if registrations.cached(path, **kwargs):
+                return
+            await asyncio.sleep(0.5)
+
+    async def fetch_clip(self, clip: MotionClip) -> Path:
+        path = ditto_sources.clip_path(clip.motion_sha256)
+        if path.exists():
+            return path
+        chunks, size = [], 0
+        async with http.stream("GET", clip.motion_url, timeout=60) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > MAX_CLIP_BYTES:
+                    raise ValueError("motion clip too large")
+                chunks.append(chunk)
+        return await asyncio.to_thread(ditto_sources.store_clip, b"".join(chunks), clip.motion_sha256)
+
+    def reply_source(self, clip_type: str) -> tuple[Path, str]:
+        """The clip this reply's mood calls for, else talk, else the still portrait."""
+        for wanted in (clip_type, "talk"):
+            if wanted in self.clip_paths:
+                return self.clip_paths[wanted], wanted
+        return self.portrait_path, "still"
 
     @property
     def fps(self) -> int:
@@ -310,6 +423,13 @@ class CallSession:
                 await self.state("listening")
 
     async def take_turn(self, pcm: bytes):
+        self.in_turn = True
+        try:
+            await self._take_turn(pcm)
+        finally:
+            self.in_turn = False
+
+    async def _take_turn(self, pcm: bytes):
         started = time.monotonic()
         samples = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
         wav = live_media.encode_wav(samples, live_media.VAD_RATE)
@@ -334,9 +454,11 @@ class CallSession:
         turn = response.json()
         chat_s = time.monotonic() - started - asr_s
         await self.event("turn", seq=self.seq)
-        LOG.info("live_turn call_id=%s seq=%d asr=%.2fs chat=%.2fs", self.request.call_id, self.seq, asr_s, chat_s)
-        await self.speak(turn.get("segments") or [turn["reply"]], turn.get("emotion") or "neutral",
-                         turn.get("gesture") or "none", started)
+        emotion, gesture = turn.get("emotion") or "neutral", turn.get("gesture") or "none"
+        source, source_kind = self.reply_source(turn.get("clip_type") or "talk") if self.video else (None, "voice")
+        LOG.info("live_turn call_id=%s seq=%d asr=%.2fs chat=%.2fs emotion=%s gesture=%s source=%s wanted=%s",
+                 self.request.call_id, self.seq, asr_s, chat_s, emotion, gesture, source_kind, turn.get("clip_type"))
+        await self.speak(turn.get("segments") or [turn["reply"]], emotion, gesture, started, source)
 
     async def transcribe(self, wav: bytes) -> str:
         data = {"language": self.request.language} if self.request.language else {}
@@ -352,7 +474,8 @@ class CallSession:
         samples, rate = await asyncio.to_thread(live_media.decode_wav, response.content)
         return await asyncio.to_thread(live_media.resample, samples, rate, OUT_RATE)
 
-    async def speak(self, segments: list[str], emotion: str, gesture: str, turn_started: float):
+    async def speak(self, segments: list[str], emotion: str, gesture: str, turn_started: float,
+                    source: Path | None = None):
         loop = asyncio.get_running_loop()
         reply = ReplyTimeline(self.fps, 0 if not self.video else round(START_BUFFER_S * self.fps))
         reply.turn_started = turn_started
@@ -370,12 +493,14 @@ class CallSession:
 
             def on_done(error):
                 if error:
-                    LOG.warning("live_render_failed call_id=%s error=%r", self.request.call_id, error)
+                    LOG.warning("live_render_failed call_id=%s aborted=%s error=%r", self.request.call_id,
+                                reply.aborted, error, exc_info=error)
                 reply.render_done = True
                 loop.call_soon_threadsafe(self.renderer_idle.set)
             # Ditto setup (~0.4 s) overlaps the first sentence's synthesis.
-            setup = asyncio.create_task(asyncio.to_thread(live_ditto.DittoStream, sdk, self.portrait_path, emotion,
-                                                          gesture, reply.add_frame, on_done))
+            # A motion clip starts at its first frame (next_offset stays 0): the portrait it was made from.
+            setup = asyncio.create_task(asyncio.to_thread(live_ditto.DittoStream, sdk, source or self.portrait_path,
+                                                          emotion, gesture, reply.add_frame, on_done))
         else:
             reply.render_done, reply.last_frame = True, VOICE_ONLY
         self.reply, self.speaking = reply, True
@@ -410,8 +535,18 @@ class CallSession:
             if stream:
                 stream.finish()  # on_done marks the renderer idle once the last frames are out
                 finished = True
+            waited = 0.0
             while not reply.aborted and reply.played < reply.total_frames():
                 await asyncio.sleep(0.05)
+                waited = 0.0 if reply.played else waited + 0.05
+                if waited > RENDER_STALL_S:  # never leave the caller on a frozen "thinking"
+                    LOG.warning("live_render_stalled call_id=%s frames_rendered=%d audio_frames=%d", self.request.call_id,
+                                len(reply.frames), reply.total_frames())
+                    import faulthandler, sys
+                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)  # where the renderer is stuck
+                    reply.abort()
+                    await self.event("error", code="unavailable",
+                                     message="Sorry, I lost my train of thought. Say that again?")
         finally:
             reply.audio_complete = True
             if stream is None and setup is not None:
@@ -439,57 +574,68 @@ class CallSession:
         silence = rtc.AudioFrame(bytes(spf * 2), OUT_RATE, 1, spf)
         h, w = (self.idle_rgb.shape[:2]) if self.video else (0, 0)
 
-        def video_frame(rgb):
+        def fit(rgb):
+            """Motion-clip frames come at the clip's size; the call's video track has the portrait's."""
             if rgb.shape[:2] != (h, w):
                 import cv2
                 rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
-            return rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, np.ascontiguousarray(rgb, np.uint8).tobytes())
+            return rgb
+
+        def video_frame(rgb):
+            return rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, np.ascontiguousarray(fit(rgb), np.uint8).tobytes())
 
         idle = video_frame(self.idle_rgb) if self.video else None
         fade: list[np.ndarray] = []
         was_playing = False
         while not self.stop_event.is_set():
-            reply = self.reply
-            item = reply.take() if reply else "end"
-            if isinstance(item, tuple):
-                rgb, chunk = item
-                if not was_playing:
-                    was_playing = True
-                    LOG.info("live_first_frame call_id=%s seconds=%.2f", self.request.call_id,
-                             time.monotonic() - reply.turn_started)
-                    await self.state("speaking")
-                audio = rtc.AudioFrame(live_media.to_pcm16(chunk).tobytes(), OUT_RATE, 1, spf)
+            try:
+                reply = self.reply
+                item = reply.take() if reply else "end"
+                if isinstance(item, tuple):
+                    rgb, chunk = item
+                    if not was_playing:
+                        was_playing = True
+                        LOG.info("live_first_frame call_id=%s seconds=%.2f", self.request.call_id,
+                                 time.monotonic() - reply.turn_started)
+                        await self.state("speaking")
+                    audio = rtc.AudioFrame(live_media.to_pcm16(chunk).tobytes(), OUT_RATE, 1, spf)
+                    if self.video:
+                        fade = [fit(rgb)]
+                        await self.av.push(video_frame(fade[0]))
+                        await self.av.push(audio)
+                    else:
+                        await audio_source.capture_frame(audio)
+                    continue
+                if item == "wait" and was_playing:  # next frame still rendering: hold the face, brief pause
+                    if self.video:
+                        await self.av.push(video_frame(fade[0]))
+                        await self.av.push(silence)
+                    else:
+                        await audio_source.capture_frame(silence)
+                    continue
+                if item == "end" and was_playing:
+                    was_playing = False
+                    if reply and reply.aborted and self.av:
+                        await self.av.clear_queue()
+                    elif fade and self.video:  # ease back to the portrait instead of snapping
+                        last = fade[0].astype(np.float32)
+                        target = self.idle_rgb.astype(np.float32)
+                        for step in range(1, 6):
+                            mix = last + (target - last) * (step / 6)
+                            await self.av.push(video_frame(mix.astype(np.uint8)))
+                            await self.av.push(silence)
+                    fade = []
                 if self.video:
-                    fade = [rgb]
-                    await self.av.push(video_frame(rgb))
-                    await self.av.push(audio)
-                else:
-                    await audio_source.capture_frame(audio)
-                continue
-            if item == "wait" and was_playing:  # next frame still rendering: hold the face, brief pause
-                if self.video:
-                    await self.av.push(video_frame(fade[0]))
+                    await self.av.push(idle)
                     await self.av.push(silence)
                 else:
                     await audio_source.capture_frame(silence)
-                continue
-            if item == "end" and was_playing:
-                was_playing = False
-                if reply and reply.aborted and self.av:
-                    await self.av.clear_queue()
-                elif fade and self.video:  # ease back to the portrait instead of snapping
-                    last = fade[0].astype(np.float32)
-                    target = self.idle_rgb.astype(np.float32)
-                    for step in range(1, 6):
-                        mix = last + (target - last) * (step / 6)
-                        await self.av.push(video_frame(mix.astype(np.uint8)))
-                        await self.av.push(silence)
-                fade = []
-            if self.video:
-                await self.av.push(idle)
-                await self.av.push(silence)
-            else:
-                await audio_source.capture_frame(silence)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # one bad frame must never end the call's media
+                LOG.exception("live_media_error call_id=%s", self.request.call_id)
+                was_playing, fade = False, []
+                await asyncio.sleep(0.05)
 
 
 def _detail(response: httpx.Response) -> dict:

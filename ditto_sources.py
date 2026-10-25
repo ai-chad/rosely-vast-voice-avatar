@@ -101,7 +101,7 @@ class RegistrationCache:
         if path.parent != clip_dir() or path.suffix != ".mp4" or not SHA_RE.fullmatch(sha):
             self.last = "uncached"
             return self.registrar(source_path, max_dim=max_dim, n_frames=n_frames, **crop)
-        key = f"{sha}-{max_dim}-" + "-".join(f"{k}={crop[k]}" for k in sorted(crop))
+        key = self._key(sha, max_dim, crop)
         with self.lock:
             if key in self.ram:
                 self.ram.move_to_end(key)
@@ -122,6 +122,21 @@ class RegistrationCache:
                 while len(self.ram) > self.ram_items:
                     self.ram.popitem(last=False)
         return _fresh(info, offset)
+
+    @staticmethod
+    def _key(sha: str, max_dim, crop: dict) -> str:
+        return f"{sha}-{max_dim}-" + "-".join(f"{k}={crop[k]}" for k in sorted(crop))
+
+    def cached(self, source_path, max_dim=1920, **crop) -> str | None:
+        """"ram" or "disk" when this clip's registration is already cached, else None.
+
+        Lets a caller avoid the GPU registration path (e.g. the live agent, which loads
+        clips only from cache and leaves fresh registrations to the turn renderer)."""
+        key = self._key(Path(source_path).stem, max_dim, crop)
+        with self.lock:
+            if key in self.ram:
+                return "ram"
+        return "disk" if self.disk_dir is not None and self._disk_file(key).exists() else None
 
     def stats(self) -> dict:
         disk = sorted(self.disk_dir.glob("*.pkl")) if self.disk_dir and self.disk_dir.exists() else []
