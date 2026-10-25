@@ -1,4 +1,4 @@
-"""Rosely Ditto talking-head renderer (TensorRT, RTX 3090). Opt-in alongside MuseTalk.
+"""Rosely Ditto talking-head renderer (TensorRT, RTX 3090): every video reply.
 
 Ditto animates the whole portrait (head motion, blinks, expressions) instead of
 only the mouth, and accepts per-reply emotion + gesture controls (acting.py).
@@ -27,7 +27,7 @@ import acting
 import ditto_sources
 
 LOG = logging.getLogger("uvicorn.error")  # uvicorn configures this one; custom loggers stay silent
-BUNDLE_ROOT = Path(os.getenv("BUNDLE_ROOT", "/workspace/rosely-voice-musetalk-v1"))
+BUNDLE_ROOT = Path(os.getenv("BUNDLE_ROOT", "/workspace/rosely-voice-v1"))
 DITTO_ROOT = Path(os.getenv("DITTO_ROOT", str(BUNDLE_ROOT / "source" / "ditto-talkinghead")))
 DITTO_MODELS = Path(os.getenv("DITTO_MODELS", str(BUNDLE_ROOT / "models" / "ditto")))
 API_KEY = os.environ.get("VOICE_API_KEY", "")

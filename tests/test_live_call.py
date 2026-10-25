@@ -100,7 +100,7 @@ def test_chunk_padding_keeps_both_timelines_whole():
 def test_gateway_refuses_live_join_when_disabled(monkeypatch):
     pytest.importorskip('fastapi')
     monkeypatch.setenv('GATEWAY_API_KEY', 'k')
-    monkeypatch.setenv('DITTO_ENABLED', '0')
+    monkeypatch.setenv('LIVE_CALL_ENABLED', '0')
     gateway = load_file('voice_gateway')
     from fastapi.testclient import TestClient
     with TestClient(gateway.app) as client:

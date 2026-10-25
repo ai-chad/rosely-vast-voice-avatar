@@ -16,8 +16,8 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-MODEL_PATH = os.environ.get('TTS_MODEL_PATH', '/workspace/rosely-voice-musetalk-v1/models/chatterbox-turbo')
-VOICES_DIR = Path(os.environ.get('VOICES_DIR', '/workspace/rosely-voice-musetalk-v1/voices'))
+MODEL_PATH = os.environ.get('TTS_MODEL_PATH', '/workspace/rosely-voice-v1/models/chatterbox-turbo')
+VOICES_DIR = Path(os.environ.get('VOICES_DIR', '/workspace/rosely-voice-v1/voices'))
 CACHE_DIR = VOICES_DIR / '.conditionals'
 API_KEY = os.environ.get('VOICE_API_KEY', '')
 MAX_TEXT_CHARS = int(os.environ.get('TTS_MAX_TEXT_CHARS', '2500'))

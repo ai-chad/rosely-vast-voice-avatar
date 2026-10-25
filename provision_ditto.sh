@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in Ditto talking-head engine (ENABLE_DITTO=1), installed beside MuseTalk.
+# Ditto talking-head engine (video replies and live calls).
 # Called by provision_vast.sh after the base install; safe to re-run.
 set -Eeuo pipefail
 log(){ printf '\n[%s] %s\n' "$(date -Is)" "$*"; }
@@ -7,7 +7,7 @@ die(){ printf '[FATAL] %s\n' "$*" >&2; exit 1; }
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${WORKSPACE:-/workspace}"
-BUNDLE_ROOT="${BUNDLE_ROOT:-${WORKSPACE}/rosely-voice-musetalk-v1}"
+BUNDLE_ROOT="${BUNDLE_ROOT:-${WORKSPACE}/rosely-voice-v1}"
 ENVS="${WORKSPACE}/rosely-venvs"
 UV="${WORKSPACE}/rosely-bootstrap-venv/bin/uv"
 BOOT_PY="${WORKSPACE}/rosely-bootstrap-venv/bin/python"
@@ -68,7 +68,6 @@ ENV_FILE="${WORKSPACE}/rosely-voice-avatar.env"
 sed -i '/^DITTO_/d; /^LIVE_CALL_ENABLED=/d' "$ENV_FILE"
 cat >> "$ENV_FILE" <<EOF
 LIVE_CALL_ENABLED=${LIVE_CALL_ENABLED:-1}
-DITTO_ENABLED=1
 DITTO_PORT=8005
 DITTO_ROOT=${DITTO_ROOT}
 DITTO_MODELS=${BUNDLE_ROOT}/models/ditto

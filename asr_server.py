@@ -9,7 +9,7 @@ import torch
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from qwen_asr import Qwen3ASRModel
 
-MODEL_PATH = os.environ.get('ASR_MODEL_PATH', '/workspace/rosely-voice-musetalk-v1/models/Qwen3-ASR-0.6B')
+MODEL_PATH = os.environ.get('ASR_MODEL_PATH', '/workspace/rosely-voice-v1/models/Qwen3-ASR-0.6B')
 API_KEY = os.environ.get('VOICE_API_KEY', '')
 MAX_UPLOAD_BYTES = int(os.environ.get('ASR_MAX_UPLOAD_BYTES', str(50 * 1024 * 1024)))
 model = None

@@ -1,5 +1,7 @@
-"""No-GPU checks for the opt-in Ditto engine: acting controls and MuseTalk fallback."""
+"""No-GPU checks for the Ditto engine: acting controls and the gateway request contract."""
 import asyncio
+
+import pytest
 import importlib.util
 import sys
 from pathlib import Path
@@ -37,17 +39,33 @@ def test_controls_shape_gestures_and_fallbacks():
     assert set(wink) <= {0, 1, 2}
 
 
-def test_gateway_falls_back_to_musetalk_without_ditto(monkeypatch):
-    monkeypatch.delenv('DITTO_ENABLED', raising=False)
+def test_gateway_requests_are_ditto_with_acting():
     gateway = load_file('voice_gateway')
-    assert gateway.DITTO_ENABLED is False
-    assert asyncio.run(gateway.render_ditto(b'img', '.png', b'wav', 'happy', 'nod')) is None
-    request = gateway.GenerateAvatarRequest(image_base64='eA==', input='hi', engine='ditto', emotion='happy', gesture='nod')
+    request = gateway.GenerateAvatarRequest(image_base64='eA==', input='hi', emotion='happy', gesture='nod')
     assert (request.engine, request.emotion, request.gesture) == ('ditto', 'happy', 'nod')
-    assert gateway.GenerateAvatarRequest(image_base64='eA==', input='hi').engine == 'musetalk'
+    assert gateway.GenerateAvatarRequest(image_base64='eA==', input='hi', engine='musetalk').engine == 'musetalk'  # old backends: ignored
 
 
-def test_video_sources_skip_ditto(monkeypatch):
-    monkeypatch.setenv('DITTO_ENABLED', '1')
+def test_video_portraits_are_refused(monkeypatch):
+    from fastapi import HTTPException
     gateway = load_file('voice_gateway')
-    assert asyncio.run(gateway.render_ditto(b'video', '.mp4', b'wav', 'happy', 'nod')) is None
+    gateway.GATEWAY_API_KEY = 'k'
+    gateway.client = object()
+    request = gateway.GenerateAvatarRequest(image_base64='eA==', image_filename='me.mp4', input='hi')
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(gateway.generate_avatar(request, x_api_key='k'))
+    assert error.value.status_code == 400 and 'still portrait' in error.value.detail
+
+
+def test_ditto_failure_is_an_error_not_a_fallback(monkeypatch):
+    import httpx
+    from fastapi import HTTPException
+    gateway = load_file('voice_gateway')
+
+    class Down:
+        async def post(self, *args, **kwargs):
+            raise httpx.ConnectError('down')
+    gateway.client = Down()
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(gateway.render_ditto(b'img', '.png', b'wav', 'happy', 'nod'))
+    assert error.value.status_code == 502

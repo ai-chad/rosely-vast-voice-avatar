@@ -7,8 +7,8 @@ ENV_FILE="${WORKSPACE}/rosely-voice-avatar.env"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 export VOICE_API_KEY GATEWAY_API_KEY BUNDLE_ROOT ASR_MODEL_PATH TTS_MODEL_PATH VOICES_DIR \
-  AVATAR_MEDIA_ROOT MUSE_PYTHON ASR_PORT TTS_PORT AVATAR_PORT GATEWAY_PORT MUSE_BATCH_SIZE
-export DITTO_ENABLED="${DITTO_ENABLED:-0}" DITTO_PORT="${DITTO_PORT:-8005}" DITTO_ROOT DITTO_MODELS
+  AVATAR_MEDIA_ROOT ASR_PORT TTS_PORT GATEWAY_PORT
+export DITTO_PORT="${DITTO_PORT:-8005}" DITTO_ROOT DITTO_MODELS
 export LIVE_CALL_ENABLED="${LIVE_CALL_ENABLED:-0}" LIVE_PORT="${LIVE_PORT:-8006}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_MODULE_LOADING=LAZY
@@ -41,6 +41,7 @@ wait_health(){
   tail -n 120 "$logfile" >&2 || true
   exit 1
 }
+# "avatar" was the MuseTalk service on workers provisioned before its removal.
 for name in gateway live ditto avatar tts asr; do stop_pid "$RUN/$name.pid"; done
 sleep 2
 start_api(){
@@ -54,18 +55,15 @@ start_api(){
 }
 start_api asr asr asr_server 127.0.0.1 "$ASR_PORT"
 start_api tts tts tts_server 127.0.0.1 "$TTS_PORT"
-start_api avatar muse avatar_server 127.0.0.1 "$AVATAR_PORT"
-if [[ "$DITTO_ENABLED" == 1 ]]; then
-  # TensorRT 8.6.1 needs the cuDNN 8 kept private to the Ditto environment.
+# TensorRT 8.6.1 needs the cuDNN 8 kept private to the Ditto environment.
+(export LD_LIBRARY_PATH="${DITTO_CUDNN8_DIR}:${LD_LIBRARY_PATH:-}"
+ start_api ditto ditto ditto_server 127.0.0.1 "$DITTO_PORT") || exit 1
+if [[ "$LIVE_CALL_ENABLED" == 1 ]]; then
+  # Live calls: the streaming Ditto renderer + LiveKit client (one call at a time).
+  # Optional: if it fails, turn-based voice/video keep working and calls report unavailable.
   (export LD_LIBRARY_PATH="${DITTO_CUDNN8_DIR}:${LD_LIBRARY_PATH:-}"
-   start_api ditto ditto ditto_server 127.0.0.1 "$DITTO_PORT") || exit 1
-  if [[ "$LIVE_CALL_ENABLED" == 1 ]]; then
-    # Live calls: the streaming Ditto renderer + LiveKit client (one call at a time).
-    # Optional: if it fails, turn-based voice/video keep working and calls report unavailable.
-    (export LD_LIBRARY_PATH="${DITTO_CUDNN8_DIR}:${LD_LIBRARY_PATH:-}"
-     start_api live ditto live_agent 127.0.0.1 "$LIVE_PORT") || echo '[WARN] live agent failed; live calls unavailable' >&2
-  fi
+   start_api live ditto live_agent 127.0.0.1 "$LIVE_PORT") || echo '[WARN] live agent failed; live calls unavailable' >&2
 fi
 start_api gateway asr voice_gateway 0.0.0.0 "$GATEWAY_PORT"
-echo '[Rosely] All three model services and authenticated gateway are online.'
+echo '[Rosely] ASR, TTS and Ditto services and the authenticated gateway are online.'
 nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv || true
