@@ -231,3 +231,12 @@ def test_clip_sized_frames_play_and_fade_back_without_stopping_the_media(agent):
     videos = [p for p in pushed if p[0] == 'video']
     assert len(videos) > 10  # the reply, its fade back, then idle portrait frames keep flowing
     assert all(p[1:3] == (54, 96) and p[3] == 54 * 96 * 3 for p in videos)
+
+
+def test_clip_memory_is_released_when_a_call_ends(agent, monkeypatch):
+    module, _ = agent
+    cache = module.ditto_sources.RegistrationCache(lambda *a, **k: None, ram_items=4, disk_dir=None)
+    cache.ram['clip-a'] = {'f_s_lst': [np.zeros(4)]}
+    monkeypatch.setattr(module, 'registrations', cache)
+    module.release_clip_memory()
+    assert not cache.ram

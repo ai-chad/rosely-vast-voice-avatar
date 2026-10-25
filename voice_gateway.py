@@ -228,8 +228,10 @@ class WarmRequest(BaseModel):
 async def warm_clips(request: WarmRequest, x_api_key: str | None = Header(default=None)):
     """Download and pre-register a character's motion clips before its next replies need them.
 
-    Clips are registered one at a time and the GPU lock is released between them,
-    so a real turn never waits behind a whole batch.
+    This does not take the gateway's GPU lock: transcription and speech must never wait
+    behind a warm-up (a cold batch takes ~10-20 s, right when a video chat opens). Ditto
+    serializes its own work, registering one clip at a time, so a reply render waits at
+    most for the clip being registered.
     """
     authorize(x_api_key)
     assert client is not None
@@ -239,13 +241,12 @@ async def warm_clips(request: WarmRequest, x_api_key: str | None = Header(defaul
         if sha is None:
             results[clip.motion_sha256[:12]] = 'unavailable'
             continue
-        async with gpu_request_lock:
-            try:
-                warmed = await client.post(DITTO_URL + '/v1/ditto/warm', headers=internal_headers(),
-                                           data={'motion_sha256': sha})
-                results[sha[:12]] = warmed.json().get('cache') if warmed.status_code == 200 else f'http {warmed.status_code}'
-            except httpx.HTTPError as exc:
-                results[sha[:12]] = f'error {type(exc).__name__}'
+        try:
+            warmed = await client.post(DITTO_URL + '/v1/ditto/warm', headers=internal_headers(),
+                                       data={'motion_sha256': sha})
+            results[sha[:12]] = warmed.json().get('cache') if warmed.status_code == 200 else f'http {warmed.status_code}'
+        except httpx.HTTPError as exc:
+            results[sha[:12]] = f'error {type(exc).__name__}'
     return {'ok': True, 'clips': results}
 
 
