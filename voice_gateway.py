@@ -30,7 +30,8 @@ MAX_STT_AUDIO_BYTES = int(os.getenv('MAX_STT_AUDIO_BYTES', str(50*1024*1024)))
 MAX_AVATAR_FILE_BYTES = int(os.getenv('MAX_AVATAR_SOURCE_BYTES', str(25*1024*1024)))
 MAX_AVATAR_AUDIO_BYTES = int(os.getenv('MAX_AVATAR_AUDIO_BYTES', str(10*1024*1024)))
 client: httpx.AsyncClient | None = None
-# A single GPU may not tolerate simultaneous ASR, TTS and Ditto render jobs.
+# Serializes Ditto clip renders and transcription. TTS is not under it: each model server has its
+# own lock, and synthesizing a reply's next part while the current part renders shortens replies.
 gpu_request_lock = asyncio.Lock()
 
 
@@ -129,9 +130,8 @@ async def tts(request: TTSRequest, x_api_key: str | None = Header(default=None))
     authorize(x_api_key)
     assert client is not None
     try:
-        async with gpu_request_lock:
-            result = await client.post(TTS_URL + '/v1/audio/speech', headers=internal_headers(),
-                                       json=request.model_dump(exclude_none=True))
+        result = await client.post(TTS_URL + '/v1/audio/speech', headers=internal_headers(),
+                                   json=request.model_dump(exclude_none=True))
     except httpx.HTTPError as exc:
         raise HTTPException(502, f'TTS error: {exc}')
     if result.status_code >= 400:
@@ -161,6 +161,48 @@ class GenerateAvatarRequest(BaseModel):
     motion_base64: str | None = None
     # Start point in the clip's back-and-forth walk (random per reply; continued per sentence).
     motion_offset_frames: int = Field(default=0, ge=0, le=1_000_000)
+    # The reply's next parts: their speech is synthesized while this part's face renders, and
+    # the next clip request for the same text and voice on this worker uses it (no TTS wait).
+    prefetch_inputs: list[str] = Field(default_factory=list, max_length=4)
+
+
+# Pre-synthesized speech for upcoming reply parts: (text, voice) -> task returning WAV bytes.
+PREFETCH_LIMIT = 16
+prefetched_speech: dict[tuple[str, str | None], asyncio.Task] = {}
+
+
+async def synthesize(text: str, voice: str | None) -> bytes:
+    assert client is not None
+    try:
+        speech = await client.post(TTS_URL + '/v1/audio/speech', headers=internal_headers(),
+                                   json={'input': text, 'voice': voice})
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f'TTS request failed: {exc}') from exc
+    if speech.status_code >= 400:
+        raise upstream_error('tts', speech)
+    return speech.content
+
+
+def prefetch_speech(texts: list[str], voice: str | None) -> None:
+    for text in texts:
+        key = (text.strip(), voice)
+        if key[0] and key not in prefetched_speech:
+            task = asyncio.create_task(synthesize(key[0], voice))
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())  # never "unretrieved"
+            prefetched_speech[key] = task
+    while len(prefetched_speech) > PREFETCH_LIMIT:  # unclaimed (e.g. the next part went to another worker)
+        prefetched_speech.pop(next(iter(prefetched_speech))).cancel()
+
+
+async def speech_for(text: str, voice: str | None) -> bytes:
+    """This text's speech: pre-synthesized by an earlier part's request if possible."""
+    task = prefetched_speech.pop((text.strip(), voice), None)
+    if task is not None:
+        try:
+            return await task
+        except Exception:
+            pass  # synthesize it now instead
+    return await synthesize(text, voice)
 
 
 async def ensure_motion_clip(request: GenerateAvatarRequest) -> str | None:
@@ -305,14 +347,10 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
             if not audio or len(audio) > MAX_AVATAR_AUDIO_BYTES:
                 raise HTTPException(413, 'empty or oversized audio')
         else:
-            try:
-                speech = await client.post(TTS_URL + '/v1/audio/speech',
-                    headers=internal_headers(), json={'input': request.input, 'voice': request.voice})
-            except httpx.HTTPError as exc:
-                raise HTTPException(502, f'TTS request failed: {exc}') from exc
-            if speech.status_code >= 400:
-                raise upstream_error('tts', speech)
-            audio = speech.content
+            audio = await speech_for(request.input, request.voice)
+        # This part's speech is done: the TTS server is free to work on the next parts while
+        # Ditto renders this one.
+        prefetch_speech(request.prefetch_inputs, request.voice)
         motion = motion_ready or await ensure_motion_clip(request)
         video, source = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion,
                                            request.motion_offset_frames)
