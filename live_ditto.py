@@ -13,6 +13,7 @@ way (pad_to_chunk), so lips and sound never drift apart across sentences.
 from __future__ import annotations
 
 import queue
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable
@@ -67,7 +68,8 @@ class DittoStream:
                  on_frame: Callable[[np.ndarray], None], on_done: Callable[[Exception | None], None]):
         self.sdk, self.on_done = sdk, on_done
         labels, ctrl = acting.controls(emotion, gesture, MAX_REPLY_FRAMES)
-        sdk.setup(str(source_path), str(source_path.with_suffix(".live.mp4")), online_mode=True, emo=labels)
+        # The output path is never written (frames go to on_frame); keep it out of the shared clip store.
+        sdk.setup(str(source_path), str(Path(tempfile.gettempdir()) / "ditto-live.mp4"), online_mode=True, emo=labels)
         sdk.setup_Nd(N_d=MAX_REPLY_FRAMES, ctrl_info=ctrl)
         sdk.writer = _Sink(on_frame)
         put, count = sdk.warp_f3d_queue.put, [0]
@@ -121,8 +123,8 @@ class DittoStream:
                 if self.pos > CHUNK_SAMPLES * 4:
                     drop = self.pos - CHUNK_SAMPLES
                     self.audio, self.pos = self.audio[drop:], self.pos - drop
-            self.sdk.close()
+            self.sdk.close()  # re-raises a pipeline worker's exception
         except Exception as exc:  # surfaced to the caller; the call itself keeps going
             error = exc
         finally:
-            self.on_done(None if self.aborted else error)
+            self.on_done(error)  # reported even after abort: a stall is often a worker failure

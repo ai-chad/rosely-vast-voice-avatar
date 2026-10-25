@@ -117,3 +117,117 @@ def test_quick_start_splits_a_long_opening_at_its_first_comma():
     assert live_media.quick_start(short) == short
     no_comma = ["I really cannot believe that you actually did that today"]
     assert live_media.quick_start(no_comma) == no_comma
+
+
+@pytest.fixture
+def agent(tmp_path, monkeypatch):
+    monkeypatch.setenv('DITTO_CLIP_DIR', str(tmp_path / 'clips'))
+    module = load_file('live_agent')
+    request = module.JoinRequest(
+        call_id='00000000-0000-0000-0000-000000000001', livekit_url='wss://x.invalid', token='t' * 30,
+        user_identity='user-1', turn_url='https://x.invalid/turn', call_secret='s' * 30, voice_id='en_female_happy',
+        portrait_url='https://x.invalid/p.png',
+        motion_clips=[{'clip_type': t, 'motion_sha256': c * 64, 'motion_url': 'https://s3.invalid/' + t}
+                      for t, c in (('shy', 'c'), ('playful', 'b'), ('talk', 'a'))])
+    session = module.CallSession(request)
+    session.portrait_path = tmp_path / 'portrait.png'
+    return module, session
+
+
+def test_replies_pick_the_moods_clip_then_talk_then_the_portrait(agent):
+    module, session = agent
+    assert session.reply_source('playful') == (session.portrait_path, 'still')  # nothing registered yet
+    session.clip_paths = {'talk': Path('talk.mp4'), 'playful': Path('playful.mp4')}
+    assert session.reply_source('playful') == (Path('playful.mp4'), 'playful')
+    assert session.reply_source('flirty') == (Path('talk.mp4'), 'talk')
+
+
+def test_clips_register_talk_first_and_never_during_a_turn(agent, monkeypatch):
+    module, session = agent
+    for clip in session.request.motion_clips:  # already in the local store: no download
+        path = module.ditto_sources.clip_path(clip.motion_sha256)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'mp4')
+    calls, warmed = [], []
+    on_disk = {'a', 'b'}  # talk and playful are cached; shy must be registered by ditto_server
+
+    class Registrations:
+        last = 'disk'
+        def cached(self, path, **kwargs):
+            return 'disk' if Path(path).stem[:1] in on_disk else None
+        def __call__(self, path, **kwargs):
+            assert Path(path).stem[:1] in on_disk, 'the agent must never register on the GPU itself'
+            calls.append((Path(path).stem[:1], session.in_turn))
+
+    class Http:
+        async def post(self, url, data, **kwargs):
+            assert url.endswith('/v1/ditto/warm') and not session.in_turn
+            warmed.append(data['motion_sha256'][:1])
+            on_disk.add(data['motion_sha256'][:1])  # ditto_server saved its registration
+            return type('R', (), {'raise_for_status': lambda self: None})()
+    monkeypatch.setattr(module, 'registrations', Registrations())
+    monkeypatch.setattr(module, 'registration_kwargs', lambda: {})
+    monkeypatch.setattr(module, 'http', Http())
+
+    async def run():
+        session.in_turn = True
+        task = asyncio.create_task(session.prepare_clips())
+        await asyncio.sleep(0.5)
+        # Cached clips load (CPU) even during a turn; the GPU warm-up waits for the turn to end.
+        assert [c[0] for c in calls] == ['a', 'b'] and warmed == []
+        session.in_turn = False
+        await task
+    asyncio.run(run())
+    assert calls == [('a', True), ('b', True), ('c', False)]  # talk, playful, shy
+    assert warmed == ['c']
+    assert set(session.clip_paths) == {'talk', 'playful', 'shy'}
+
+
+def test_registration_cache_reports_cached_clips_without_registering(tmp_path, monkeypatch):
+    monkeypatch.setenv('DITTO_CLIP_DIR', str(tmp_path / 'clips'))
+    sources = load_file('ditto_sources')
+    cache = sources.RegistrationCache(lambda *a, **k: pytest.fail('must not register'), disk_dir=tmp_path / 'cache')
+    clip = sources.clip_path('d' * 64)
+    assert cache.cached(clip, max_dim=1920, crop_scale=2.3) is None
+    (tmp_path / 'cache').mkdir()
+    cache._disk_file(cache._key('d' * 64, 1920, {'crop_scale': 2.3})).write_bytes(b'x')
+    assert cache.cached(clip, max_dim=1920, crop_scale=2.3) == 'disk'
+
+
+def test_clip_sized_frames_play_and_fade_back_without_stopping_the_media(agent):
+    module, session = agent
+    session.video = True
+    session.idle_rgb = np.zeros((96, 54, 3), np.uint8)  # portrait size
+    pushed = []
+
+    class Frame:
+        def __init__(self, *args):
+            self.args = args
+
+    class AV:
+        async def push(self, frame):
+            pushed.append(frame.args)
+            if len(pushed) > 60:
+                session.stop_event.set()
+            await asyncio.sleep(0)
+
+        async def clear_queue(self):
+            pass
+    rtc = type('rtc', (), {'AudioFrame': Frame, 'VideoBufferType': type('T', (), {'RGB24': 4}),
+                           'VideoFrame': lambda w, h, kind, data: Frame('video', w, h, len(data))})
+    session.av = AV()
+    reply = live_media.ReplyTimeline(fps=20, start_buffer_frames=0)
+    reply.turn_started = 0.0
+    reply.add_audio(np.zeros(live_media.OUT_RATE // 20 * 2, np.float32))
+    for _ in range(2):
+        reply.add_frame(np.full((80, 48, 3), 200, np.uint8))  # motion-clip size differs from the portrait
+    reply.audio_complete = reply.render_done = True
+    session.reply = reply
+
+    async def no_state(*args, **kwargs):
+        pass
+    session.state = no_state
+    asyncio.run(session.media_loop(rtc, None))
+    videos = [p for p in pushed if p[0] == 'video']
+    assert len(videos) > 10  # the reply, its fade back, then idle portrait frames keep flowing
+    assert all(p[1:3] == (54, 96) and p[3] == 54 * 96 * 3 for p in videos)
