@@ -1,30 +1,23 @@
-"""Authenticated entrypoint for dedicated Vast RTX 3090. Voice JSON routes retained."""
+"""Authenticated entrypoint for the Vast RTX 3090 worker: ASR, TTS, Ditto video clips, live calls."""
 from __future__ import annotations
 import asyncio
 import base64
 import binascii
 import hmac
-import hashlib
-import re
 import os
 from contextlib import asynccontextmanager
-from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import Response
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import ditto_sources
 
 ASR_URL = f"http://127.0.0.1:{os.getenv('ASR_PORT', '8001')}"
 TTS_URL = f"http://127.0.0.1:{os.getenv('TTS_PORT', '8002')}"
-AVATAR_URL = f"http://127.0.0.1:{os.getenv('AVATAR_PORT', '8003')}"
-# Ditto is opt-in per worker (DITTO_ENABLED=1); requests for it fall back to MuseTalk otherwise.
-DITTO_ENABLED = os.getenv('DITTO_ENABLED', '0') == '1'
 DITTO_URL = f"http://127.0.0.1:{os.getenv('DITTO_PORT', '8005')}"
-# Live calls are opt-in per worker (LIVE_CALL_ENABLED=1, needs Ditto): live_agent.py joins the call room.
-LIVE_CALL_ENABLED = DITTO_ENABLED and os.getenv('LIVE_CALL_ENABLED', '0') == '1'
+# Live calls are opt-in per worker (LIVE_CALL_ENABLED=1): live_agent.py joins the call room.
+LIVE_CALL_ENABLED = os.getenv('LIVE_CALL_ENABLED', '0') == '1'
 LIVE_URL = f"http://127.0.0.1:{os.getenv('LIVE_PORT', '8006')}"
 MAX_MOTION_CLIP_BYTES = int(os.getenv('MAX_MOTION_CLIP_BYTES', str(30 * 1024 * 1024)))
 # Stand-in portrait for motion-clip renders (Ditto uses the clip, never this image).
@@ -37,7 +30,7 @@ MAX_STT_AUDIO_BYTES = int(os.getenv('MAX_STT_AUDIO_BYTES', str(50*1024*1024)))
 MAX_AVATAR_FILE_BYTES = int(os.getenv('MAX_AVATAR_SOURCE_BYTES', str(25*1024*1024)))
 MAX_AVATAR_AUDIO_BYTES = int(os.getenv('MAX_AVATAR_AUDIO_BYTES', str(10*1024*1024)))
 client: httpx.AsyncClient | None = None
-# A single GPU may not tolerate simultaneous ASR, TTS and MuseTalk render jobs.
+# A single GPU may not tolerate simultaneous ASR, TTS and Ditto render jobs.
 gpu_request_lock = asyncio.Lock()
 
 
@@ -91,8 +84,7 @@ class TTSRequest(BaseModel):
 @app.get('/health')
 async def health():
     assert client is not None
-    upstreams = {'asr': ASR_URL, 'tts': TTS_URL, 'avatar': AVATAR_URL, **({'ditto': DITTO_URL} if DITTO_ENABLED else {}),
-                 **({'live': LIVE_URL} if LIVE_CALL_ENABLED else {})}
+    upstreams = {'asr': ASR_URL, 'tts': TTS_URL, 'ditto': DITTO_URL, **({'live': LIVE_URL} if LIVE_CALL_ENABLED else {})}
     statuses = await asyncio.gather(*(client.get(url + '/health') for url in upstreams.values()),
                                     return_exceptions=True)
     services = {}
@@ -149,55 +141,17 @@ async def tts(request: TTSRequest, x_api_key: str | None = Header(default=None))
             'sample_rate': result.headers.get('x-sample-rate'), 'size_bytes': len(result.content)}
 
 
-@app.post('/v1/avatar/prepare')
-async def avatar_prepare(avatar_id: str = Form(...), file: UploadFile = File(...),
-                         x_api_key: str | None = Header(default=None)):
-    authorize(x_api_key)
-    assert client is not None
-    payload = await file.read(MAX_AVATAR_FILE_BYTES + 1)
-    if not payload or len(payload) > MAX_AVATAR_FILE_BYTES:
-        raise HTTPException(413, 'empty or oversized avatar input')
-    try:
-        result = await client.post(AVATAR_URL + '/v1/avatar/prepare', headers=internal_headers(),
-                                   data={'avatar_id': avatar_id},
-                                   files={'file': (file.filename or 'avatar.png', payload, file.content_type or 'application/octet-stream')})
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f'avatar prepare error: {exc}')
-    if result.status_code >= 400:
-        raise upstream_error('avatar', result)
-    return result.json()
-
-
-@app.post('/v1/avatar/render')
-async def avatar_render(avatar_id: str = Form(...), audio: UploadFile = File(...),
-                        x_api_key: str | None = Header(default=None)):
-    authorize(x_api_key)
-    assert client is not None
-    payload = await audio.read(MAX_AVATAR_AUDIO_BYTES + 1)
-    if not payload or len(payload) > MAX_AVATAR_AUDIO_BYTES:
-        raise HTTPException(413, 'empty or oversized audio input')
-    try:
-        result = await client.post(AVATAR_URL + '/v1/avatar/render', headers=internal_headers(),
-                                   data={'avatar_id': avatar_id},
-                                   files={'audio': (audio.filename or 'speech.wav', payload, audio.content_type or 'audio/wav')})
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f'avatar render error: {exc}')
-    if result.status_code >= 400:
-        raise upstream_error('avatar', result)
-    return Response(result.content, media_type='video/mp4',
-                    headers={'Cache-Control': 'no-store', 'Content-Disposition': 'attachment; filename="avatar.mp4"'})
-
-
 class GenerateAvatarRequest(BaseModel):
-    """One-request Serverless adapter. Multi-request prepared-avatar IDs are not durable across workers."""
+    """One spoken Ditto clip per request (Serverless: no state is shared between workers)."""
     # May be empty when a motion clip is sent: Ditto then renders from the clip alone.
     image_base64: str = ""
     audio_base64: str | None = None
     input: str | None = Field(default=None, max_length=2500)
     voice: str | None = None
     image_filename: str = "character.png"
-    # Optional Ditto engine with per-reply acting controls (see acting.py).
-    engine: Literal['musetalk', 'ditto'] = 'musetalk'
+    # Ditto is the only engine; older backends still send this field.
+    engine: str = Field(default='ditto', max_length=16)
+    # Per-reply acting controls (see acting.py).
     emotion: str = Field(default='neutral', max_length=32)
     gesture: str = Field(default='none', max_length=16)
     # Optional pre-generated motion clip for Ditto (body/hands/head), identified by its sha256.
@@ -215,7 +169,7 @@ async def ensure_motion_clip(request: GenerateAvatarRequest) -> str | None:
 
 
 async def ensure_clip(sha: str | None, url: str | None = None, inline: str | None = None) -> str | None:
-    if not sha or not DITTO_ENABLED:
+    if not sha:
         return None
     if ditto_sources.clip_path(sha).exists():
         return sha
@@ -245,10 +199,8 @@ async def ensure_clip(sha: str | None, url: str | None = None, inline: str | Non
 
 
 async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, gesture: str,
-                       motion_sha256: str | None = None, motion_offset: int = 0) -> tuple[bytes, str] | None:
-    """(Ditto clip, source used), or None when this worker cannot render it (caller falls back to MuseTalk)."""
-    if not DITTO_ENABLED or suffix not in {'.png', '.jpg', '.jpeg', '.webp'}:
-        return None
+                       motion_sha256: str | None = None, motion_offset: int = 0) -> tuple[bytes, str]:
+    """(Ditto clip, source used: "motion" or "still")."""
     assert client is not None
     try:
         rendered = await client.post(DITTO_URL + '/v1/ditto/render', headers=internal_headers(),
@@ -257,13 +209,9 @@ async def render_ditto(image: bytes, suffix: str, audio: bytes, emotion: str, ge
             files={'image': ('character' + suffix, image, 'application/octet-stream'),
                    'audio': ('speech.wav', audio, 'audio/wav')})
     except httpx.HTTPError as exc:
-        print(f'[gateway] Ditto unreachable, falling back to MuseTalk: {type(exc).__name__}', flush=True)
-        return None
-    if rendered.status_code == 413:
-        raise upstream_error('ditto', rendered)
+        raise HTTPException(502, f'Ditto unreachable: {type(exc).__name__}') from exc
     if rendered.status_code >= 400:
-        print(f'[gateway] Ditto failed ({rendered.status_code}), falling back to MuseTalk', flush=True)
-        return None
+        raise upstream_error('ditto', rendered)
     return rendered.content, rendered.headers.get('X-Ditto-Source', 'still')
 
 
@@ -328,7 +276,7 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
     if not request.image_base64:
         # Clip-only request (saves uploading the portrait each sentence). Without a usable
         # clip, ask the caller to resend with the portrait instead of guessing.
-        motion_ready = await ensure_motion_clip(request) if request.engine == 'ditto' else None
+        motion_ready = await ensure_motion_clip(request)
         if motion_ready is None:
             raise HTTPException(409, IMAGE_REQUIRED)
         image, suffix = PLACEHOLDER_PNG, '.png'
@@ -343,10 +291,8 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
         if not image or len(image) > MAX_AVATAR_FILE_BYTES:
             raise HTTPException(413, 'empty or oversized image')
         suffix = '.' + request.image_filename.rsplit('.', 1)[-1].lower() if '.' in request.image_filename else ''
-        if suffix not in {'.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.webm'}:
-            raise HTTPException(400, 'unsupported image_filename extension')
-    # Content-addressed IDs prevent accidental collisions; cache is worker-local only.
-    avatar_id = 's' + hashlib.sha256(image).hexdigest()[:24]
+        if suffix not in {'.png', '.jpg', '.jpeg', '.webp'}:
+            raise HTTPException(400, 'Ditto needs a still portrait (png, jpg or webp)')
     async with gpu_request_lock:
         if request.audio_base64 is not None:
             if len(request.audio_base64) > ((MAX_AVATAR_AUDIO_BYTES + 2) // 3) * 4 + 16:
@@ -366,35 +312,9 @@ async def generate_avatar(request: GenerateAvatarRequest, x_api_key: str | None 
             if speech.status_code >= 400:
                 raise upstream_error('tts', speech)
             audio = speech.content
-        if request.engine == 'ditto':
-            motion = motion_ready or await ensure_motion_clip(request)
-            result = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion,
-                                        request.motion_offset_frames)
-            if result is not None:
-                video, source = result
-                return {'video_base64': base64.b64encode(video).decode('ascii'),
-                        'content_type': 'video/mp4', 'size_bytes': len(video),
-                        'avatar_id': avatar_id, 'engine': 'ditto', 'ditto_source': source}
-        if not request.image_base64:
-            raise HTTPException(409, IMAGE_REQUIRED)  # never render MuseTalk from the placeholder
-        # Every serverless worker has its own local avatar cache.
-        try:
-            prepared = await client.post(AVATAR_URL + '/v1/avatar/prepare',
-                headers=internal_headers(), data={'avatar_id': avatar_id},
-                files={'file': ('character'+suffix, image, 'application/octet-stream')})
-        except httpx.HTTPError as exc:
-            raise HTTPException(502, f'avatar preparation request failed: {exc}') from exc
-        if prepared.status_code not in (200, 409):
-            raise upstream_error('avatar', prepared)
-        try:
-            rendered = await client.post(AVATAR_URL + '/v1/avatar/render',
-                headers=internal_headers(), data={'avatar_id': avatar_id},
-                files={'audio': ('speech.wav', audio, 'audio/wav')})
-        except httpx.HTTPError as exc:
-            raise HTTPException(502, f'avatar rendering request failed: {exc}') from exc
-        if rendered.status_code >= 400:
-            raise upstream_error('avatar', rendered)
-        # For short POC videos only. Production should upload MP4 to S3 and return a signed URL.
-        return {'video_base64': base64.b64encode(rendered.content).decode('ascii'),
-                'content_type': 'video/mp4', 'size_bytes': len(rendered.content),
-                'avatar_id': avatar_id, 'engine': 'musetalk'}
+        motion = motion_ready or await ensure_motion_clip(request)
+        video, source = await render_ditto(image, suffix, audio, request.emotion, request.gesture, motion,
+                                           request.motion_offset_frames)
+    # Short clips travel as base64 in the JSON response (the backend stores them in S3).
+    return {'video_base64': base64.b64encode(video).decode('ascii'), 'content_type': 'video/mp4',
+            'size_bytes': len(video), 'engine': 'ditto', 'ditto_source': source}

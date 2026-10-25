@@ -3,7 +3,7 @@
 ## Files to replace (repository root)
 
 - `provision_serverless.sh` **required** – starts key-only `sshd` via Supervisor BEFORE cloning/downloading models, regardless of Vast's `SERVERLESS` status.
-- `provision_vast.sh` **required** – Hugging Face model download (`fetch_models.py`, SHA256-verified) and chumpy fixes, with a setuptools 80.10.2 pin before the Perth TTS import check.
+- `provision_vast.sh` **required** – Hugging Face model download (`fetch_models.py`, SHA256-verified), with a setuptools 80.10.2 pin before the Perth TTS import check.
 - `serverless_start.sh` **recommended** – only launches `worker.py` when `SERVERLESS=true`; otherwise runs API adapter persistently for standalone debugging.
 - `VAST_TEMPLATE_COMMAND.sh` **optional** – corrected example template command, 100 GB disk. Don't put keys in git.
 
