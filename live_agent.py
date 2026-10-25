@@ -99,6 +99,17 @@ def load_sdk():
     return loaded
 
 
+def release_clip_memory() -> None:
+    """Drop the call's motion-clip registrations (~2.3 GB each) once it ends. Held between calls,
+    they pushed the worker into swap and slowed every other model (transcription took ~20 s);
+    the next call reloads them from the shared disk cache in a few seconds."""
+    import gc
+    if registrations is not None:
+        with registrations.lock:
+            registrations.ram.clear()
+    gc.collect()
+
+
 def registration_kwargs() -> dict:
     """The registrar arguments StreamSDK.setup uses, so a warmed clip hits the same cache entry."""
     kw = sdk._merge_kwargs(dict(sdk.default_kwargs), {})
@@ -291,6 +302,7 @@ class CallSession:
                 await self.room.disconnect()
             if self.portrait_path:
                 self.portrait_path.unlink(missing_ok=True)
+            release_clip_memory()
             LOG.info("live_call_ended call_id=%s reason=%s turns=%d", self.request.call_id, self.end_reason, self.seq)
 
     async def prepare_clips(self):
