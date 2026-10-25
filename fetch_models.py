@@ -47,7 +47,8 @@ DITTO_ENGINES = ["appearance_extractor_fp16", "blaze_face_fp16", "decoder_fp16",
                  "motion_extractor_fp32", "stitch_network_fp16", "warp_network_fp16"]
 DITTO_SOURCES = [
     ("digital-avatar/ditto-talkinghead", "e4a2f60328ee7c32af585ac4b3cce299e4c8e254", "models/ditto", [
-        "ditto_cfg/v0.4_hubert_cfg_trt.pkl", *(f"ditto_trt_Ampere_Plus/{e}.engine" for e in DITTO_ENGINES)]),
+        "ditto_cfg/v0.4_hubert_cfg_trt.pkl", "ditto_cfg/v0.4_hubert_cfg_trt_online.pkl",
+        *(f"ditto_trt_Ampere_Plus/{e}.engine" for e in DITTO_ENGINES)]),
 ]
 
 

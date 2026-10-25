@@ -53,6 +53,14 @@ With `ENABLE_DITTO=1`, provisioning runs `provision_ditto.sh`: Ditto source at a
 
 Motion clips (optional): `/v1/avatar/generate` with `engine: "ditto"` also accepts `motion_sha256` plus either `motion_url` (HTTPS) or `motion_base64` for a short pre-generated clip of the character. Ditto keeps the clip's body, hand and head motion and drives only the mouth and expression. The gateway verifies the digest and keeps clips in `DITTO_CLIP_DIR` (default `$AVATAR_MEDIA_ROOT/ditto-clips`), so later turns can send just `motion_sha256`; a missing or invalid clip falls back to the still portrait (`ditto_source` in the response says which). Registering a 10 s clip takes ~6 s and ~2.3 GB, so registrations are cached in RAM (`DITTO_SOURCE_CACHE_RAM`, default 3 clips, ~2.3 GB each) and on disk (`DITTO_SOURCE_CACHE_DIR`, `DITTO_SOURCE_CACHE_DISK_GB` default 20; ~1.3 GB per clip as float16, output byte-identical). Measured on an RTX 3090: first use ~11 s render, RAM hit ~4.5 s, disk hit ~7.3 s for a ~3.6 s reply.
 
+### Live calls (WebRTC, optional)
+
+With Ditto installed, `provision_ditto.sh` also adds the LiveKit client and voice activity detection to the Ditto environment and sets `LIVE_CALL_ENABLED=1`. `start_services.sh` then starts `live_agent.py` on loopback `8006` (streaming Ditto, ~2.6 GB more VRAM). If it fails to start, turn-based voice/video keep working and the gateway's health ignores it.
+
+The backend starts a call with `/v1/live/join` (room URL, a short-lived LiveKit token, the caller's identity, the character's portrait URL and voice, and a per-call secret for turn callbacks). The worker joins the room as the character. It detects the end of each caller turn (webrtcvad), transcribes it with the local ASR and posts it to the backend's `turn_url`; the backend runs the character chat and billing and returns the reply. The worker then synthesizes it sentence by sentence and streams Ditto video at 20 fps with the matching audio. Between replies the still portrait shows, and speaking over the character interrupts it. Only one call runs per worker at a time (`409 live_call_busy`). The worker never holds LiveKit API credentials.
+
+Measured on an RTX 3090: Ditto online renders ~22 fps (every fifth frame is skipped before warp/decode for 20 fps output), and lips land within about one frame of the audio. From reply text to the first spoken frame takes ~2.5 s, mostly Chatterbox synthesizing the first sentence.
+
 ### Vast endpoint
 
 **`vastai create instance` only creates a GPU instance / candidate worker.** You must also create or attach it through Vast's Serverless **endpoint / worker group** configuration (UI or SDK), and configure a suitable warm minimum. For an inexpensive POC, start with one worker, then scale after measuring latency, VRAM and response limits.

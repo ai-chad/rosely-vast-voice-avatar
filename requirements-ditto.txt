@@ -1,3 +1,4 @@
+aiofiles==25.1.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -22,12 +23,13 @@ httptools==0.9.0
 httpx==0.28.1
 huggingface_hub==0.36.2
 idna==3.20
-imageio==2.36.1
 imageio-ffmpeg==0.5.1
+imageio==2.36.1
 Jinja2==3.1.6
 joblib==1.4.2
 lazy_loader==0.4
 librosa==0.10.2.post1
+livekit==1.1.20
 llvmlite==0.43.0
 MarkupSafe==3.0.3
 mpmath==1.3.0
@@ -54,6 +56,7 @@ pillow==12.3.0
 platformdirs==4.3.6
 polygraphy==0.53.6
 pooch==1.8.2
+protobuf==7.36.2
 pycparser==2.22
 pydantic==2.14.1
 pydantic_core==2.50.1
@@ -74,10 +77,12 @@ threadpoolctl==3.5.0
 tifffile==2024.12.12
 tqdm==4.67.1
 triton==3.1.0
+types-protobuf==7.35.1.20260906
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.54.0
 uvloop==0.23.0
 watchfiles==1.3.0
+webrtcvad-wheels==2.0.14
 websockets==16.1.1

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -23,6 +23,9 @@ AVATAR_URL = f"http://127.0.0.1:{os.getenv('AVATAR_PORT', '8003')}"
 # Ditto is opt-in per worker (DITTO_ENABLED=1); requests for it fall back to MuseTalk otherwise.
 DITTO_ENABLED = os.getenv('DITTO_ENABLED', '0') == '1'
 DITTO_URL = f"http://127.0.0.1:{os.getenv('DITTO_PORT', '8005')}"
+# Live calls are opt-in per worker (LIVE_CALL_ENABLED=1, needs Ditto): live_agent.py joins the call room.
+LIVE_CALL_ENABLED = DITTO_ENABLED and os.getenv('LIVE_CALL_ENABLED', '0') == '1'
+LIVE_URL = f"http://127.0.0.1:{os.getenv('LIVE_PORT', '8006')}"
 MAX_MOTION_CLIP_BYTES = int(os.getenv('MAX_MOTION_CLIP_BYTES', str(30 * 1024 * 1024)))
 # Stand-in portrait for motion-clip renders (Ditto uses the clip, never this image).
 PLACEHOLDER_PNG = base64.b64decode(
@@ -88,7 +91,8 @@ class TTSRequest(BaseModel):
 @app.get('/health')
 async def health():
     assert client is not None
-    upstreams = {'asr': ASR_URL, 'tts': TTS_URL, 'avatar': AVATAR_URL, **({'ditto': DITTO_URL} if DITTO_ENABLED else {})}
+    upstreams = {'asr': ASR_URL, 'tts': TTS_URL, 'avatar': AVATAR_URL, **({'ditto': DITTO_URL} if DITTO_ENABLED else {}),
+                 **({'live': LIVE_URL} if LIVE_CALL_ENABLED else {})}
     statuses = await asyncio.gather(*(client.get(url + '/health') for url in upstreams.values()),
                                     return_exceptions=True)
     services = {}
@@ -99,7 +103,8 @@ async def health():
             services[name] = {'ok': False, 'http_status': result.status_code}
         else:
             services[name] = result.json()
-    healthy = all(s.get('ok') for s in services.values())
+    # The live agent is optional: turn-based voice/video stay healthy without it.
+    healthy = all(s.get('ok') for name, s in services.items() if name != 'live')
     return {'ok': healthy, 'service': 'voice-avatar-gateway', **services}
 
 
@@ -294,6 +299,23 @@ async def warm_clips(request: WarmRequest, x_api_key: str | None = Header(defaul
             except httpx.HTTPError as exc:
                 results[sha[:12]] = f'error {type(exc).__name__}'
     return {'ok': True, 'clips': results}
+
+
+@app.post('/v1/live/join')
+async def live_join(request: Request, x_api_key: str | None = Header(default=None)):
+    """Ask this worker's live agent to join a call room as the character (see live_agent.py)."""
+    authorize(x_api_key)
+    if not LIVE_CALL_ENABLED:
+        raise HTTPException(409, {'error': 'live_call_unavailable'})
+    assert client is not None
+    try:
+        joined = await client.post(LIVE_URL + '/v1/live/join', headers=internal_headers(),
+                                   json=await request.json(), timeout=60)
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f'live agent unreachable: {type(exc).__name__}') from exc
+    if joined.status_code >= 400:
+        raise upstream_error('live', joined)
+    return joined.json()
 
 
 @app.post('/v1/avatar/generate')
