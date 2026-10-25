@@ -28,6 +28,7 @@ import numpy as np
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+import live_ditto  # imported before load_sdk() changes the working directory
 import live_media
 from live_media import OUT_RATE, ReplyTimeline, TurnDetector
 
@@ -239,7 +240,6 @@ class CallSession:
 
     @property
     def fps(self) -> int:
-        import live_ditto
         return live_ditto.OUTPUT_FPS
 
     async def watchdog(self, user_joined: asyncio.Event):
@@ -353,7 +353,6 @@ class CallSession:
         return await asyncio.to_thread(live_media.resample, samples, rate, OUT_RATE)
 
     async def speak(self, segments: list[str], emotion: str, gesture: str, turn_started: float):
-        import live_ditto
         loop = asyncio.get_running_loop()
         reply = ReplyTimeline(self.fps, 0 if not self.video else round(START_BUFFER_S * self.fps))
         reply.turn_started = turn_started
