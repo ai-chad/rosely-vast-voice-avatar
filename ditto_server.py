@@ -34,6 +34,11 @@ API_KEY = os.environ.get("VOICE_API_KEY", "")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_AVATAR_SOURCE_BYTES", str(25 * 1024 * 1024)))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AVATAR_AUDIO_BYTES", str(10 * 1024 * 1024)))
 MAX_AUDIO_SECONDS = float(os.getenv("MAX_AVATAR_AUDIO_SECONDS", "12"))
+# Speed: replies render at 20 fps (Ditto's motion runs at 25; every fifth frame is skipped before
+# the GPU-heavy warp/decode, lips stay within ~30 ms of the audio) with fewer diffusion steps for
+# the audio-to-motion model. DITTO_OUTPUT_FPS=25 / DITTO_SAMPLING_STEPS=50 restore the originals.
+OUTPUT_FPS = 20 if os.getenv("DITTO_OUTPUT_FPS", "20") == "20" else 25
+SAMPLING_STEPS = int(os.getenv("DITTO_SAMPLING_STEPS", "25"))
 render_lock = asyncio.Lock()
 sdk = None
 registrations: ditto_sources.RegistrationCache | None = None
@@ -92,8 +97,10 @@ def render(source_path: Path, audio_path: Path, out_path: Path, emotion: str, ge
     started = time.monotonic()
     if registrations is not None:
         registrations.next_offset = max(int(motion_offset), 0)
-    sdk.setup(str(source_path), str(silent), emo=labels)
+    sdk.setup(str(source_path), str(silent), emo=labels, sampling_timesteps=SAMPLING_STEPS)
     sdk.setup_Nd(N_d=num_frames, ctrl_info=ctrl)
+    if OUTPUT_FPS == 20:
+        thin_to_20fps(sdk)
     sdk.audio2motion_queue.put(sdk.wav2feat.wav2feat(audio))
     sdk.close()
     took = time.monotonic() - started
@@ -102,6 +109,22 @@ def render(source_path: Path, audio_path: Path, out_path: Path, emotion: str, ge
                    check=True, timeout=120)
     return {"seconds": round(seconds, 2), "render_seconds": round(took, 2), "frames": num_frames,
             "cache": registrations.last if registrations else None}
+
+
+def thin_to_20fps(stream_sdk) -> None:
+    """Write 20 fps: skip every fifth 25 fps frame before warp/decode (they set the render speed)."""
+    from core.atomic_components.writer import VideoWriterByImageIO
+    stream_sdk.writer.close()  # opened lazily: nothing was written yet
+    stream_sdk.writer = VideoWriterByImageIO(stream_sdk.tmp_output_path, fps=20)
+    put, count = stream_sdk.warp_f3d_queue.put, [0]
+
+    def thinning_put(item, *args, **kwargs):
+        if item is not None:
+            count[0] += 1
+            if count[0] % 5 == 0:
+                return None
+        return put(item, *args, **kwargs)
+    stream_sdk.warp_f3d_queue.put = thinning_put
 
 
 def registration_kwargs() -> dict:
