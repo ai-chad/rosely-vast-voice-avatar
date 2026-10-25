@@ -55,12 +55,19 @@ EOF
     'import torch, tensorrt; assert torch.cuda.is_available(); print("Ditto env ok: torch", torch.__version__, "tensorrt", tensorrt.__version__)'
   touch "$VENV/.rosely_installed"
 fi
+# Live-call packages came later; add them to environments provisioned before that.
+if ! "$VENV/bin/python" -c 'import livekit.rtc, webrtcvad' 2>/dev/null; then
+  log 'Adding live call packages (LiveKit client, voice activity detection) to the Ditto environment'
+  # shellcheck disable=SC2046
+  "$VENV/bin/python" -m pip install --no-cache-dir     $(grep -E '^(aiofiles|livekit|protobuf|types-protobuf|webrtcvad-wheels)==' "$APP_DIR/requirements-ditto.txt")
+fi
 
 log 'Enabling Ditto in the service configuration'
 ENV_FILE="${WORKSPACE}/rosely-voice-avatar.env"
 [[ -f "$ENV_FILE" ]] || die "Missing $ENV_FILE; run provision_vast.sh first."
-sed -i '/^DITTO_/d' "$ENV_FILE"
+sed -i '/^DITTO_/d; /^LIVE_CALL_ENABLED=/d' "$ENV_FILE"
 cat >> "$ENV_FILE" <<EOF
+LIVE_CALL_ENABLED=${LIVE_CALL_ENABLED:-1}
 DITTO_ENABLED=1
 DITTO_PORT=8005
 DITTO_ROOT=${DITTO_ROOT}
